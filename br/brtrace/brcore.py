@@ -273,6 +273,35 @@ def start_child():
 
 ALL = "\x00*"
 MIN_TRACK = 16
+MAX_SMALL_NAME = int(os.environ.get("BR_MAX_SMALL_NAME", "50"))
+_NAME_COUNTS = None
+
+
+def _dict_name_counts():
+    """How many class bodies in the sqlglot sources assign a dict display to each name."""
+    global _NAME_COUNTS
+    if _NAME_COUNTS is None:
+        import ast
+
+        counts = {}
+        for root, _dirs, names in os.walk(os.path.join(REPO, "sqlglot")):
+            for fn in names:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with _orig_open(os.path.join(root, fn), "rb") as fh:
+                        tree = ast.parse(fh.read())
+                except Exception:
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.ClassDef):
+                        continue
+                    for s in node.body:
+                        target = s.targets[0] if isinstance(s, ast.Assign) and len(s.targets) == 1 else getattr(s, "target", None)
+                        if isinstance(target, ast.Name) and isinstance(getattr(s, "value", None), ast.Dict):
+                            counts[target.id] = counts.get(target.id, 0) + 1
+        _NAME_COUNTS = counts
+    return _NAME_COUNTS
 TRACK_KEYS = os.environ.get("BR_TRACK_KEYS", "1") == "1"
 TRACKED = {}  # id(original dict) -> (original, TrackDict); originals kept alive
 TRACKED_NEW = {}  # "module:Qual.attr" -> label (None: untracked), not yet flushed
@@ -469,8 +498,12 @@ def track_module_dicts(module):
         for attr, val in list(vars(c).items()):
             if attr.startswith("_"):
                 continue
-            if type(val) is dict and len(val) >= MIN_TRACK:
-                cands.append((c, attr, val))
+            if type(val) is dict:
+                # Small dicts too, unless the name is a per-class schema defined on a
+                # great many classes (expression arg_types): those are read whole on
+                # every instantiation, so tracking them costs a lot and narrows nothing.
+                if len(val) >= MIN_TRACK or _dict_name_counts().get(attr, 0) <= MAX_SMALL_NAME:
+                    cands.append((c, attr, val))
             elif type(val) is TrackDict:
                 TRACKED_NEW[f"{name}:{c.__qualname__}.{attr}"] = val._br_label
     if not cands:
