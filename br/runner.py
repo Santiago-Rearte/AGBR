@@ -145,7 +145,75 @@ def install_inline_pools():
     cf.ProcessPoolExecutor = InlineProcessPoolExecutor
 
 
-def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, keep=()):
+LIST_FP_MAX = 5000  # longest class-setup list fingerprinted at calibration
+
+
+def item_fp(x):
+    """Fingerprint of one item of a list loaded by class setup (same at build and run time)."""
+    import hashlib
+
+    try:
+        return hashlib.md5(repr(x).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    except Exception:
+        return "?"
+
+
+def hook_class_setup(cls, after):
+    """Calls after(cls) right after cls's own setUpClass (inherited ones included)."""
+    import inspect
+
+    cur = inspect.getattr_static(cls, "setUpClass", None)
+    func = getattr(cur, "__func__", None)
+    if func is None:
+        return False
+
+    def setUpClass(c, _f=func):
+        _f(c)
+        if c is cls:
+            after(c)
+
+    cls.setUpClass = classmethod(setUpClass)
+    return True
+
+
+def _record_lists(cls, ckey, out):
+    """Calibration: per list attribute set up on the class, its items' fingerprints."""
+    try:
+        for name, val in list(vars(cls).items()):
+            if type(val) is list and 0 < len(val) <= LIST_FP_MAX and not name.startswith("_"):
+                out.write(f"LISTFP {ckey} {name} {json.dumps([item_fp(x) for x in val])}\n")
+    except Exception:
+        pass
+
+
+class SliceError(Exception):
+    pass
+
+
+def _slice_lists(cls, ckey, attrs, out):
+    """Verification of a data-file change: keep only the items that differ from the
+    base commit in the lists setUpClass loaded (a test using those lists then checks
+    exactly the changed data).  Anything unexpected fails the class set-up, so its
+    tests are not verified (selected)."""
+    for name, base in sorted(attrs.items()):
+        val = vars(cls).get(name)
+        if type(val) is not list:
+            out.write(f"SLICEFAIL {ckey} {name} type\n")
+            raise SliceError(name)
+        new = [item_fp(x) for x in val]
+        if len(new) != len(base):
+            out.write(f"SLICEFAIL {ckey} {name} length {len(new)}/{len(base)}\n")
+            raise SliceError(name)
+        changed = [i for i, (a, b) in enumerate(zip(new, base)) if a != b or a == "?"]
+        if len(changed) > max(3, len(base) // 20):
+            out.write(f"SLICEFAIL {ckey} {name} changed {len(changed)}/{len(base)}\n")
+            raise SliceError(name)
+        setattr(cls, name, [val[i] for i in changed])
+        out.write(f"SLICE {ckey} {name} {len(changed)}/{len(base)}\n")
+
+
+def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, keep=(), slices=None,
+                 record_lists=False):
     """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
     collection cost.  Class and module fixtures are handled by unittest.TestSuite."""
     import unittest
@@ -153,6 +221,7 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
     by_id = {}
     tests = []
     files = {}
+    hooked = set()
     for nid in nodeids:
         f, _, rest = nid.partition("::")
         files.setdefault(f, []).append((rest, nid))
@@ -174,6 +243,13 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
             test = cls(meth)
             by_id[test.id()] = nid
             tests.append(test)
+            ckey = f"{f}::{cls_name}"
+            if ckey not in hooked and (record_lists or ckey in (slices or {})):
+                hooked.add(ckey)
+                if record_lists:
+                    hook_class_setup(cls, lambda c, k=ckey: _record_lists(c, k, out))
+                elif not hook_class_setup(cls, lambda c, k=ckey: _slice_lists(c, k, slices[k], out)):
+                    out.write(f"SLICEFAIL {ckey} - hook\n")
 
     class Result(unittest.TestResult):
         def __init__(self):
@@ -463,6 +539,8 @@ def child_main(spec, wfd):
                 spec.get("default_timeout", 30.0),
                 spec.get("stop_on_fail", False),
                 [list(g) for g in (spec.get("keep") or ())],
+                spec.get("slices") or None,
+                bool(spec.get("record_lists")),
             )
             out.write("DONE\n")
             out.flush()
@@ -545,6 +623,8 @@ class Job:
         self.test_cpu = {}
         self.collect_cpu = {}
         self.setup_cpu = {}
+        self.list_fp = {}
+        self.slice_msgs = []
 
 
 def _consume(job, data):
@@ -579,6 +659,15 @@ def _consume(job, data):
         elif tag == "STATEDIFF":
             job.state_ok = False
             job.state_msg = rest
+        elif tag == "LISTFP":
+            ckey, _, rest2 = rest.partition(" ")
+            name, _, data = rest2.partition(" ")
+            try:
+                job.list_fp.setdefault(ckey, {})[name] = json.loads(data)
+            except ValueError:
+                pass
+        elif tag in ("SLICE", "SLICEFAIL"):
+            job.slice_msgs.append(f"{tag} {rest}")
         elif tag == "STOPPED":
             job.stopped = True
         elif tag == "DONE":
@@ -690,7 +779,7 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         groups[i].extend(ts)
         loads[i] += len(ts)
     jobs = [
-        Job(i, {"root": repo, "nodeids": g, "default_timeout": 600.0}, budget=900.0)
+        Job(i, {"root": repo, "nodeids": g, "default_timeout": 600.0, "record_lists": True}, budget=900.0)
         for i, g in enumerate(groups)
         if g
     ]
@@ -701,11 +790,12 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         passed |= job.passed
         if job.collect_failed or job.crashed or not job.done:
             log(f"  calibration job {job.key}: done={job.done} crash={job.crashed} collect={sorted(job.collect_failed)[:3]}")
-    test_cpu, collect_cpu, setup_cpu = {}, {}, {}
+    test_cpu, collect_cpu, setup_cpu, list_fp = {}, {}, {}, {}
     for job in jobs:
         test_cpu.update(job.test_cpu)
         collect_cpu.update(job.collect_cpu)
         setup_cpu.update(job.setup_cpu)
+        list_fp.update(job.list_fp)
     # Fixed cost of one verification job: fork, pytest start-up, an empty session.
     first = sorted(tests_list)[0]
     probe = [Job(f"probe{i}", {"root": repo, "nodeids": [first], "default_timeout": 60.0}, 120.0) for i in range(3)]
@@ -719,10 +809,12 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         log(f"  not verifiable: {t}")
     with open(out_path, "w") as fh:
         json.dump(
-            {"passed": sorted(passed), "test_cpu": test_cpu, "collect_cpu": collect_cpu, "setup_cpu": setup_cpu, "job_overhead": overheads[1]},
+            {"passed": sorted(passed), "test_cpu": test_cpu, "collect_cpu": collect_cpu, "setup_cpu": setup_cpu,
+             "job_overhead": overheads[1], "list_fp": list_fp},
             fh,
         )
     log(f"job overhead {overheads}, collect total {sum(collect_cpu.values()):.2f}s, test cpu total {sum(test_cpu.values()):.2f}s")
+    log(f"class-setup lists: {sum(len(v) for v in list_fp.values())} in {len(list_fp)} classes")
 
 
 if __name__ == "__main__":

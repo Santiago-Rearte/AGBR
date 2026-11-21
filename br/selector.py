@@ -48,6 +48,10 @@ UNIQUE_MAX = float(os.environ.get("BR_UNIQUE_MAX", "0.005"))
 # High-variance rule: the static remainder of a class/module-level change is kept
 # only if one of a few diverse cheap probes fails.
 PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
+# Probe-drop missed 2 of 60 generator-like commits (a class flag, a default argument):
+# by default the cheap remainder is verified rather than dropped.
+PROBE_VERIFY = os.environ.get("BR_PROBE_VERIFY", "1") == "1"
+PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU seconds (calibrated)
 # Probe gating of heavy tests also for changes inside functions.
 PROBES_RUNTIME = os.environ.get("BR_PROBES_RUNTIME", "0") == "1"
 PROBE_DROP_RUNTIME = os.environ.get("BR_PROBE_DROP_RUNTIME", "0") == "1"
@@ -65,6 +69,10 @@ PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
 PROBE_DROP_RT_MIN = float(os.environ.get("BR_PROBE_DROP_RT_MIN", "0"))
 PROBE_DROP_RT_N = int(os.environ.get("BR_PROBE_DROP_RT_N", "40"))
 MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot lines per traced second
+# Heavy tests that depend on a changed data file only through lists their class
+# setup loaded from it are verified on just the changed items of those lists.
+SLICE = os.environ.get("BR_SLICE", "1") == "1"
+SLICE_MIN_SEC = float(os.environ.get("BR_SLICE_MIN_SEC", "1.0"))
 
 
 def log(*args):
@@ -116,6 +124,7 @@ class Plan:
         self.stop_on_fail = False
         self.check_imports = False
         self.keyref = []  # key-level refinements, each with its unrefined fallback
+        self.sliced = {}  # heavy test -> (class key, {attr: base item fingerprints})
 
 
 def main():
@@ -162,6 +171,11 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
 
     with open(os.path.join(MAPS, "maps.pkl"), "rb") as fh:
         maps = pickle.load(fh)
+    # The maps live for the whole run: keep the collector from walking them again and
+    # again while the analysis allocates (ASTs, sets).
+    import gc
+
+    gc.freeze()
     LAZY_ALL.update(maps.get("lazy_all") or {})
     verifiable = set()
     try:
@@ -225,7 +239,9 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             # A change to data a test reads almost always changes what it observes.
             data_change = any(not fp.path.endswith(".py") for fp in fps)
             plan.fail_prior = DATA_FAIL_PRIOR if data_change else FAIL_PRIOR
-            decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of)
+            if SLICE and VERIFY and data_change and not static and plan.files is not None:
+                plan.sliced = plan_slices(an, maps, cands, idx2num, num2id, sec, verifiable, file_of)
+            decide(plan, cands - set(plan.sliced), static, verifiable, num2id, sec, pool_nums, file_of)
             runtime_only = bool(an.trace.get("runtime")) and not an.trace.get("other")
             if PROBES and VERIFY and not static and not an.trace.get("nonsite") and (
                 an.trace.get("import") or (PROBES_RUNTIME and runtime_only)
@@ -239,6 +255,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
                     elif pack(plan.static, dur_ms)[0] / 1000.0 >= PROBE_DROP_RT_MIN:
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus, limit=PROBE_DROP_RT_N)
+            if plan.sliced:
+                plan.run |= set(plan.sliced)
+                plan.static -= set(plan.sliced)
+                plan.notes.append(f"slice({len(plan.sliced)})")
             # Changed code that runs at import time can break the import of every
             # user; such patches always get an import check, even when nothing is run.
             if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
@@ -432,6 +452,19 @@ def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None, limit=N
         probes |= set(ranked[:FOCUS_PROBES])
     if not probes:
         return
+    if PROBE_VERIFY:
+        # Exact variant: the cheap verifiable remainder is run too (stopping at the
+        # first failure) instead of being dropped when the probes pass, unless that
+        # costs more CPU than PROBE_VERIFY_MAX; heavy or unverifiable tests stay
+        # conditional either way.
+        tc, sc, cc = CALIB.get("test_cpu", {}), CALIB.get("setup_cpu", {}), CALIB.get("collect_cpu", {})
+        ids = [num2id[n] for n in pool]
+        est = sum(tc.get(i, CPU_FACTOR * sec[n]) for i, n in zip(ids, pool))
+        est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
+        est += sum(cc.get(f, FILE_OVERHEAD) for f in {i.split("::", 1)[0] for i in ids})
+        if est <= PROBE_VERIFY_MAX:
+            probes |= set(pool)
+        plan.notes.append(f"{'verify' if est <= PROBE_VERIFY_MAX else 'drop'}-rest({len(pool)}:{est:.1f}s)")
     rest = plan.static - probes
     plan.conditional |= rest
     plan.static -= rest | probes
@@ -557,6 +590,52 @@ def analysis_modname(rel):
     return analysis.modname(rel)
 
 
+def plan_slices(an, maps, cands, idx2num, num2id, sec, verifiable, file_of):
+    """Heavy candidates whose only link to a changed data file is lists their class
+    setup loaded from it (setUpClass data flow, build-time attribute reads): they
+    are verified on just the list items that changed (runner: slices).
+
+    Not for a test that reads the file itself, reads it while its module is
+    collected, or is also a candidate through another changed file."""
+    import analysis
+
+    list_fp = CALIB.get("list_fp") or {}
+    per_file = an.trace.get("per_file") or []
+    group_reads = maps.get("group_reads") or {}
+    own_reads = maps.get("own_reads") or {}
+    out = {}
+    for rel, _bits, note in per_file:
+        groups = group_reads.get(rel)
+        if note != "data" or not groups:
+            continue
+        other = 0
+        for rel2, b2, _n in per_file:
+            if rel2 != rel:
+                other |= b2
+        module_groups = {g.partition(":")[2] for g in groups if not g.startswith("class:")}
+        own = own_reads.get(rel, 0)
+        for g in groups:
+            kind, _, key = g.partition(":")
+            if kind != "class":
+                continue
+            attrs = an.setup_data_attrs(key, rel)
+            base = list_fp.get(key) or {}
+            if not attrs or not all(a in base for a in attrs):
+                continue
+            users = an.setup_data_users(key, rel)
+            if not users:
+                continue
+            for i in analysis.iter_bits(users & ~own & ~other):
+                n = idx2num[i]
+                if n < 0 or n not in cands or sec[n] < SLICE_MIN_SEC or num2id[n] not in verifiable:
+                    continue
+                if not num2id[n].startswith(key + "::") or file_of[n] in module_groups:
+                    continue
+                # (two changed files feeding one test: not sliced)
+                out[n] = None if n in out else (key, {a: base[a] for a in attrs})
+    return {n: v for n, v in out.items() if v is not None}
+
+
 def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
     """Splits candidates into verified-by-running and selected-without-running."""
     from_fixed = set(plan.static)
@@ -587,6 +666,10 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
     run_sum = overhead
     files = set()
     classes = set()
+    # Every prefix up to 40 tests, then about 40 evenly spaced ones: the estimate is
+    # smooth in j, and packing every prefix of a thousand candidates costs seconds.
+    n_run = len(runnable)
+    grid = set(range(1, min(n_run, 40) + 1)) | set(range(40, n_run + 1, max(1, n_run // 40))) | {n_run}
     for j, n in enumerate(runnable, start=1):
         nid = num2id[n]
         run_sum += run_cost(n)
@@ -598,6 +681,8 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
         if c not in classes:
             classes.add(c)
             run_sum += setup_cpu.get(c, 0.0)
+        if j not in grid:
+            continue
         rest = never | set(runnable[j:]) | from_fixed
         q = plan.fail_prior
         p_rest = pack(rest, dur_ms)[0] / 1000.0
@@ -694,6 +779,10 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
                 est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
                 if est * CPU_FACTOR < 0.5 * sec[h]:
                     keep.append(sorted(ids))
+        if p.sliced:
+            spec_slices = {}
+            for _n, (key, attrs) in sorted(p.sliced.items()):
+                spec_slices.setdefault(key, {}).update(attrs)
         tcpu = CALIB.get("test_cpu", {})
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
@@ -709,6 +798,9 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
             "keep": keep,
         }
+        if p.sliced:
+            spec["slices"] = spec_slices
+            spec["stop_on_fail"] = False  # the sliced heavy tests must run
         if p.keyref:
             allowed = {}
             for info in p.keyref:
@@ -735,7 +827,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
         shutil.rmtree(job.spec["root"], ignore_errors=True)
         log(
             f"{p.commit}: verified {len(job.passed)}/{len(p.run)} pass, cpu={job.cpu:.2f}s wall={job.wall:.2f}s"
-            f" done={job.done} crash={job.crashed}"
+            f" done={job.done} crash={job.crashed}" + (f" {' '.join(job.slice_msgs)[:200]}" if job.slice_msgs else "")
         )
         if job.spec.get("import_check") and (not job.imports_ok or job.import_hang or not job.all_ok):
             # The import check itself crashed, hung or was killed: assume the patched
@@ -744,14 +836,11 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             p.extra |= set(id2num.values())
         if job.import_failed:
             # A module that imports cleanly on the base no longer does: every test
-            # file importing it (even transitively, at collection) fails.
+            # file importing it (even transitively, at collection) fails.  (Everything
+            # is selected, so there is nothing to narrow: re-running the analysis on
+            # the released caches would only burn CPU.)
             log(f"{p.commit}: import failures {sorted(job.import_failed)[:3]}, selecting everything")
             p.extra |= set(id2num.values())
-        for mod in job.import_failed:
-            rel = mod.replace(".", "/")
-            rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
-            bits = an.broken_module(rel)
-            p.extra |= {idx2num[i] for i in __import__("analysis").iter_bits(bits) if idx2num[i] >= 0}
         for nodeid in job.collect_failed:
             f = nodeid.split("::", 1)[0]
             p.extra |= {n for i, n in id2num.items() if i.split("::", 1)[0] == f}

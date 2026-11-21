@@ -880,7 +880,27 @@ class Analyzer:
     # -- data read by shared test setup ------------------------------------------
 
     def setup_data_users(self, class_key, rel):
-        """Tests of a test class that use the data its setup methods loaded from rel.
+        """Tests of a test class that use the data its setup methods loaded from rel
+        (None when unsure; see setup_data_attrs)."""
+        attrs = self.setup_data_attrs(class_key, rel)
+        if not attrs:
+            return None
+        f, _, qual = class_key.partition("::")
+        kd = self.keydata()
+        tracked, reads, sets = kd.get("tracked") or {}, kd.get("reads") or {}, kd.get("sets") or []
+        mod = modname(f) or ""
+        cqual = qual.replace("::", ".")
+        bits = 0
+        for a in attrs:
+            label = f"{mod}:{cqual}.{a}"
+            if not tracked.get(label):
+                return None
+            for sid in (reads.get(label) or {}).values():
+                bits |= sets[sid]
+        return bits
+
+    def setup_data_attrs(self, class_key, rel):
+        """The class attributes a test class's setup methods load from rel.
 
         Data flow inside the class's setup/teardown methods: a statement naming the
         file (a string constant rel ends with) taints what it assigns (or the objects
@@ -979,20 +999,7 @@ class Analyzer:
                     tainted |= tg
                     changed = True
         attrs = sorted(a for kind, a in tainted if kind == "attr")
-        if not attrs:
-            return None
-        kd = self.keydata()
-        tracked, reads, sets = kd.get("tracked") or {}, kd.get("reads") or {}, kd.get("sets") or []
-        mod = modname(f) or ""
-        cqual = qual.replace("::", ".")
-        bits = 0
-        for a in attrs:
-            label = f"{mod}:{cqual}.{a}"
-            if not tracked.get(label):
-                return None
-            for sid in (reads.get(label) or {}).values():
-                bits |= sets[sid]
-        return bits
+        return attrs or None
 
     def func_lines_bits(self, rel, node):
         """Tests that ran any function or lambda defined inside node.
@@ -1154,6 +1161,7 @@ class Analyzer:
                 b, note, st = self.all_bits, "error", True
             bits |= b
             static |= st
+            self.trace.setdefault("per_file", []).append((fp.path, b, note))
             notes.append(f"{fp.path}:{note}")
             if not (note.startswith("sites=") or note in ("noop", "mode")):
                 self.trace["other"] = True
