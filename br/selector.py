@@ -45,6 +45,10 @@ DIVERSE_PROBES = int(os.environ.get("BR_DIVERSE_PROBES", "15"))
 PROBES_PER_HEAVY = int(os.environ.get("BR_PROBES_PER_HEAVY", "6"))
 MIN_PROBES = int(os.environ.get("BR_MIN_PROBES", "3"))
 UNIQUE_MAX = float(os.environ.get("BR_UNIQUE_MAX", "0.005"))
+# High-variance rule: the static remainder of a class/module-level change is kept
+# only if one of a few diverse cheap probes fails.
+PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
+PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
 MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot lines per traced second
 
 
@@ -206,6 +210,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of)
             if PROBES and VERIFY and not static and an.trace.get("import") and not an.trace.get("nonsite"):
                 add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec)
+                if PROBE_DROP and not plan.keyref:
+                    # (key-level selections are exact: one specific test may be the
+                    # only one to fail, and no handful of probes would see it)
+                    probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
             # Changed code that runs at import time can break the import of every
             # user; such patches always get an import check, even when nothing is run.
             if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
@@ -337,6 +345,28 @@ def probe_eligible(maps):
                     eligible |= bit
         _ELIGIBLE = eligible
     return _ELIGIBLE
+
+
+def probe_drop(plan, maps, num2idx, num2id, verifiable, sec):
+    """Every statically selected test becomes conditional on a few diverse cheap
+    probes (the cheapest verifiable test of each file): selected only when the
+    verification run finds the change live."""
+    if not plan.static:
+        return
+    pool = [n for n in plan.static if sec[n] < HEAVY_SEC and n in num2idx and maps["tests"][num2idx[n]] in verifiable]
+    first = {}
+    for n in sorted(pool, key=lambda n: (sec[n], n)):
+        first.setdefault(num2id[n].split("::", 1)[0], n)
+    probes = set(sorted(first.values(), key=lambda n: (sec[n], n))[:PROBE_DROP_N])
+    if not probes:
+        return
+    rest = plan.static - probes
+    plan.conditional |= rest
+    plan.static -= rest | probes
+    if not plan.run:
+        plan.stop_on_fail = True
+    plan.run |= probes
+    plan.notes.append(f"probedrop({len(rest)}:{len(probes)})")
 
 
 def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
