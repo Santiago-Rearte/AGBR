@@ -676,11 +676,20 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     for p in plans:
         root = os.path.join(WORK, p.commit)
         nodeids = order_for_run([num2id[n] for n in p.run], p.stop_on_fail or bool(p.conditional))
+        keep = []
         if PER_HEAVY and p.cond_near:
-            # The gated heavy tests' own neighbours first: once they pass, a later
-            # failure (which stops the run) no longer drags those heavy tests in.
-            first = {num2id[x] for nb in p.cond_near.values() for x in nb}
-            nodeids = [x for x in nodeids if x in first] + [x for x in nodeids if x not in first]
+            # The strict gated heavy tests' own neighbours still run after the first
+            # failure stops the run: they decide whether those heavy tests are needed.
+            # Only when that costs well under what selecting the heavy test would.
+            tc, sc = CALIB.get("test_cpu", {}), CALIB.get("setup_cpu", {})
+            for h, nb in sorted(p.cond_near.items()):
+                if not is_strict(h):
+                    continue
+                ids = [num2id[x] for x in nb]
+                est = sum(tc.get(i, sec[id2num[i]]) for i in ids)
+                est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
+                if est * CPU_FACTOR < 0.5 * sec[h]:
+                    keep.append(sorted(ids))
         tcpu = CALIB.get("test_cpu", {})
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
@@ -694,6 +703,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "lazy_all": LAZY_ALL,
             # Once a cheap test fails the dominated heavy tests are selected anyway.
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
+            "keep": keep,
         }
         if p.keyref:
             allowed = {}

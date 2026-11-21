@@ -145,7 +145,7 @@ def install_inline_pools():
     cf.ProcessPoolExecutor = InlineProcessPoolExecutor
 
 
-def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
+def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, keep=()):
     """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
     collection cost.  Class and module fixtures are handled by unittest.TestSuite."""
     import unittest
@@ -183,6 +183,8 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
             self.t0 = 0.0
             self.t_end = _cpu()
             self.cls = None
+            self.ran = set()
+            self.stop_on_fail = stop_on_fail
 
         def _nid(self, test):
             return by_id.get(test.id()) if hasattr(test, "id") else None
@@ -208,12 +210,17 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
             if nid is None:
                 return
             out.write(f"CPU {self.t_end - self.t0:.4f} {nid}\n")
+            self.ran.add(nid)
             if nid in self.ok and nid not in self.bad:
                 out.write(f"PASS {nid}\n")
-            elif stop_on_fail:
+            elif self.stop_on_fail:
                 out.write("STOPPED\n")
                 out.flush()
-                os._exit(0)
+                if not keep:
+                    os._exit(0)
+                # Some tests must still run (the neighbours deciding whether gated
+                # heavy tests are needed): stop this pass, run them next.
+                self.shouldStop = True
 
         def _bad(self, test):
             nid = self._nid(test)
@@ -251,7 +258,38 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
             if nid is not None:
                 self.ok.add(nid)
 
-    unittest.TestSuite(tests).run(Result())
+    first = Result()
+    unittest.TestSuite(tests).run(first)
+    # (When nothing passed before the first failure the change breaks everything it
+    # touches: the gated heavy tests are selected anyway, so skip the second pass.)
+    if first.shouldStop and keep and (first.ok - first.bad):
+        # keep: groups of tests (the neighbours of one gated heavy test); a group is
+        # decided as soon as one of its tests fails.
+        groups = [set(g) for g in keep]
+
+        def failed(nid):
+            return nid in first.ran and nid not in (first.ok - first.bad)
+
+        open_groups = [g for g in groups if not any(failed(n) for n in g)]
+        wanted = set().union(*open_groups) if open_groups else set()
+        rest = [t for t in tests if by_id.get(t.id()) in wanted and by_id.get(t.id()) not in first.ran]
+        if rest:
+
+            class Second(Result):
+                def stopTest(self, test):
+                    super().stopTest(test)
+                    nid = self._nid(test)
+                    if nid is not None and not (nid in self.ok and nid not in self.bad):
+                        for g in list(open_groups):
+                            if nid in g:
+                                open_groups.remove(g)
+                        if not open_groups:
+                            self.shouldStop = True
+
+            second = Second()
+            second.stop_on_fail = False
+            second.ran = first.ran
+            unittest.TestSuite(rest).run(second)
 
 
 def check_lazy_attributes(out, base_all, only):
@@ -416,6 +454,7 @@ def child_main(spec, wfd):
                 spec.get("timeouts", {}),
                 spec.get("default_timeout", 30.0),
                 spec.get("stop_on_fail", False),
+                [list(g) for g in (spec.get("keep") or ())],
             )
             out.write("DONE\n")
             out.flush()
