@@ -197,6 +197,7 @@ class Analyzer:
         self.import_lines = maps.get("import_lines", {})
         self.mod_classes = maps.get("mod_classes", {})
         self.eager = set(maps.get("eager", ()))
+        self.trace = {"runtime": [], "other": False}
 
     def release(self):
         """Forgets cached ASTs and sources (they are rebuilt on demand)."""
@@ -393,8 +394,12 @@ class Analyzer:
                     units = self.block_units(n, f, i)
                 else:
                     units = [header_span(n) or span(n)]
+            if depth == 0:
+                self.trace["runtime"].append((rel, units, span(site[jf][0])))
             return self.units_bits(rel, units) | self.reads(rel)
 
+        if depth == 0:
+            self.trace["other"] = True
         # Import-time site: module or class body, or a def/class header.
         classes = []
         hdr = None
@@ -440,6 +445,9 @@ class Analyzer:
         qual = ".".join(c.name for c in chain)
         key = f"{mod}:{qual}"
         users = self.family_bits(key) | self.func_lines_bits(rel, cls)
+        # A class is often used through the classes that hold it (a dialect's
+        # tokenizer_class, parser_class...) without ever being instantiated.
+        users |= self.holder_bits(rel, chain)
         # Subclasses defined elsewhere may use the attribute without being instantiated.
         fam = self.m["family"].get(key, [])
         if len(fam) <= 40:
@@ -471,6 +479,55 @@ class Analyzer:
                 pats.append(r"\b" + re.escape(cls.name) + r"\b")
             if pats:
                 bits |= self.refs_bits(re.compile("|".join(pats)), rel, depth + 1, skip_span=span(cls))
+        return bits
+
+    def holder_bits(self, rel, chain):
+        """Users of the classes that contain or refer to the innermost class of chain:
+        enclosing classes, and classes whose body names it (in this module or in
+        modules importing it).  Applied transitively, a few levels deep."""
+        key = ("holders", rel, ".".join(c.name for c in chain))
+        if key in self._memo:
+            return self._memo[key]
+        self._memo[key] = 0
+        mod = modname(rel) or ""
+        bits = 0
+        holders = set()
+        for k in range(1, len(chain)):
+            holders.add((rel, ".".join(c.name for c in chain[:k])))
+        name = chain[-1].name
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        files = [rel] + [f for f in self.importer_files(rel) if f != rel] if len(chain) == 1 else [rel]
+        for f in files:
+            text = self.corpus().get(f)
+            if text is None or not pat.search(text):
+                continue
+            for ln in {text.count("\n", 0, m.start()) + 1 for m in pat.finditer(text)}:
+                path = self.locate(f, ln)
+                if not path or any(isinstance(n, FUNC) and fl == "body" for n, fl, _i in path):
+                    continue
+                classes = [n for n, fl, _i in path if isinstance(n, ast.ClassDef) and fl == "body"]
+                if not classes:
+                    continue
+                if f == rel and [c.name for c in classes] == [c.name for c in chain]:
+                    continue  # the class's own body
+                holders.add((f, ".".join(c.name for c in classes)))
+        for f, qual in holders:
+            hkey = f"{modname(f)}:{qual}"
+            bits |= self.family_bits(hkey)
+            node = self._find_class(f, qual)
+            if node is not None:
+                bits |= self.func_lines_bits(f, node)
+                hchain = []
+                body = self.tree(f).body
+                for part in qual.split("."):
+                    c = next((s for s in body if isinstance(s, ast.ClassDef) and s.name == part), None)
+                    if c is None:
+                        break
+                    hchain.append(c)
+                    body = c.body
+                if hchain and len(holders) < 50:
+                    bits |= self.holder_bits(f, hchain)
+        self._memo[key] = bits
         return bits
 
     def attr_readers(self, names, origin_rel, stmt):
@@ -677,7 +734,11 @@ class Analyzer:
     # -- files --------------------------------------------------------------
 
     def analyze(self, fps):
-        """Returns (bits, notes, static) for a whole patch."""
+        """Returns (bits, notes, static) for a whole patch.
+
+        self.trace then says whether every change was a statement inside a function
+        ("runtime" sites with their line units and enclosing function span)."""
+        self.trace = {"runtime": [], "other": False}
         bits = 0
         notes = []
         static = False
@@ -690,6 +751,8 @@ class Analyzer:
             bits |= b
             static |= st
             notes.append(f"{fp.path}:{note}")
+            if not (note.startswith("sites=") or note in ("noop", "mode")):
+                self.trace["other"] = True
         return bits, notes, static
 
     def analyze_file(self, fp):

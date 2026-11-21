@@ -34,6 +34,9 @@ DATA_FAIL_PRIOR = float(os.environ.get("BR_DATA_FAIL_PRIOR", "0.85"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 CALIB = {}
+HEAVY_SEC = float(os.environ.get("BR_HEAVY_SEC", "1.5"))
+MIN_CHEAP_COVER = int(os.environ.get("BR_MIN_CHEAP_COVER", "3"))
+DOMINANCE = os.environ.get("BR_DOMINANCE", "1") == "1"
 
 
 def log(*args):
@@ -79,6 +82,8 @@ class Plan:
         self.job = None
         self.notes = []
         self.fail_prior = FAIL_PRIOR
+        self.dominated = set()
+        self.conditional = set()
 
 
 def main():
@@ -150,6 +155,11 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
     file_of = {t["number"]: t["file"] for t in tests}
 
     an = analysis.Analyzer(maps, REPO)
+    idx_sec = [sec.get(n, 0.0) if n >= 0 else 0.0 for n in idx2num]
+    cheap_all = 0
+    for i, n in enumerate(idx2num):
+        if n >= 0 and idx_sec[i] < HEAVY_SEC and maps["tests"][i] in verifiable:
+            cheap_all |= 1 << i
     plans = []
     for c in commits:
         plan = Plan(c)
@@ -164,6 +174,9 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             bits, notes, static = an.analyze(fps)
             plan.notes.extend(notes)
             cands = {idx2num[i] for i in analysis.iter_bits(bits) if idx2num[i] >= 0}
+            if not static and DOMINANCE:
+                dom = dominated_heavy(an, bits, idx_sec, cheap_all)
+                plan.dominated = {idx2num[i] for i in analysis.iter_bits(dom) if idx2num[i] >= 0}
             if unknown and any(fp.path.endswith(".py") for fp in fps):
                 static = True if len(unknown) > 50 else static
                 plan.static |= set(unknown)
@@ -192,13 +205,54 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
         nums = set(p.static) | set(p.extra)
         if p.run:
             passed = p.job.passed if p.job is not None else set()
+            live = False
             for n in p.run:
                 if num2id[n] not in passed:
                     nums.add(n)
+                    live = True
+            job = p.job
+            if job is None or not job.done or job.crashed or job.collect_failed or job.import_failed:
+                live = True
+            if p.conditional and live:
+                nums |= p.conditional
+        elif p.conditional:
+            nums |= p.conditional
         results[p.commit] = sorted(n for n in nums if n in dur_ms)
         cost, workers = pack(results[p.commit], dur_ms)
         log(f"{p.commit}: selected={len(results[p.commit])} cost={cost / 1000:.3f}s workers={len(workers)}")
     return results
+
+
+def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
+    """Heavy candidates that cannot fail unless a cheap candidate fails too.
+
+    Only for patches whose every change is a statement inside a function.  A heavy
+    test is dominated when, for each change, at least MIN_CHEAP_COVER cheap tests run
+    the changed statement and every line of the enclosing function the heavy test
+    runs is also run by some cheap test (no path only the heavy test exercises)."""
+    trace = an.trace
+    if trace["other"] or not trace["runtime"]:
+        return 0
+    heavy = 0
+    for i in __import__("analysis").iter_bits(cand_bits):
+        if idx_sec[i] >= HEAVY_SEC:
+            heavy |= 1 << i
+    if not heavy:
+        return 0
+    skippable = heavy
+    for rel, units, (flo, fhi) in trace["runtime"]:
+        covering = an.units_bits(rel, units) & cheap_all & cand_bits
+        if bin(covering).count("1") < MIN_CHEAP_COVER:
+            return 0
+        d = an.lines.get(rel) or {}
+        for ln in range(flo, fhi + 1):
+            sid = d.get(ln)
+            if sid is None:
+                continue
+            b = an.sets[sid]
+            if not (b & cheap_all):
+                skippable &= ~b
+    return skippable
 
 
 def prepare_overlay(plan, fps, an, patchlib):
@@ -275,6 +329,38 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
             best_cost, best_j = cost, j
     plan.run = set(runnable[:best_j])
     plan.static = from_fixed | (cands - plan.run)
+
+    # Dominance: heavy tests whose code every cheap covering test also runs are only
+    # selected when one of those cheap tests fails.
+    dom = plan.dominated & cands
+    if dom:
+        run_all = [n for n in runnable if n not in dom and sec[n] < HEAVY_SEC]
+        if run_all:
+            rest = (cands - set(run_all) - dom) | from_fixed
+            cost = overhead
+            files, classes = set(), set()
+            for n in run_all:
+                nid = num2id[n]
+                cost += run_cost(n)
+                if file_of[n] not in files:
+                    files.add(file_of[n])
+                    cost += collect_cpu.get(file_of[n], FILE_OVERHEAD)
+                c = nid.rsplit("::", 1)[0]
+                if c not in classes:
+                    classes.add(c)
+                    cost += setup_cpu.get(c, 0.0)
+            q = plan.fail_prior
+            # Live change: the run stops at the first failure (assume a quarter of it ran)
+            # and everything is selected.  Otherwise the whole cheap set ran and passed.
+            cost = (1.0 - q) * cost + q * (overhead + 0.25 * (cost - overhead))
+            cost += q * pack(cands | from_fixed, dur_ms)[0] / 1000.0
+            cost += (1.0 - q) * pack(rest, dur_ms)[0] / 1000.0
+            if cost < best_cost:
+                best_cost = cost
+                plan.run = set(run_all)
+                plan.conditional = dom
+                plan.static = rest
+                plan.notes.append(f"dominance({len(dom)})")
     plan.notes.append(f"est={best_cost:.2f}s")
 
 
@@ -303,7 +389,14 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
         }
         budget = 20.0 + sum(timeouts.values())
-        spec = {"root": root, "nodeids": nodeids, "timeouts": timeouts, "import_check": p.modules}
+        spec = {
+            "root": root,
+            "nodeids": nodeids,
+            "timeouts": timeouts,
+            "import_check": p.modules,
+            # Once a cheap test fails the dominated heavy tests are selected anyway.
+            "stop_on_fail": bool(p.conditional),
+        }
         job = runner.Job(p.commit, spec, budget)
         job.plan = p
         p.job = job

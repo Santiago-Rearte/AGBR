@@ -145,7 +145,7 @@ def install_inline_pools():
     cf.ProcessPoolExecutor = InlineProcessPoolExecutor
 
 
-def run_unittest(nodeids, out, timeouts, default_timeout):
+def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
     """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
     collection cost.  Class and module fixtures are handled by unittest.TestSuite."""
     import unittest
@@ -210,6 +210,10 @@ def run_unittest(nodeids, out, timeouts, default_timeout):
             out.write(f"CPU {self.t_end - self.t0:.4f} {nid}\n")
             if nid in self.ok and nid not in self.bad:
                 out.write(f"PASS {nid}\n")
+            elif stop_on_fail:
+                out.write("STOPPED\n")
+                out.flush()
+                os._exit(0)
 
         def _bad(self, test):
             nid = self._nid(test)
@@ -270,7 +274,13 @@ def child_main(spec, wfd):
             except BaseException as error:  # noqa: BLE001
                 out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
         if spec.get("mode", "unittest") == "unittest":
-            run_unittest(spec["nodeids"], out, spec.get("timeouts", {}), spec.get("default_timeout", 30.0))
+            run_unittest(
+                spec["nodeids"],
+                out,
+                spec.get("timeouts", {}),
+                spec.get("default_timeout", 30.0),
+                spec.get("stop_on_fail", False),
+            )
             out.write("DONE\n")
             out.flush()
             os._exit(0)
@@ -331,6 +341,7 @@ class Job:
         self.import_failed = set()
         self.done = False
         self.crashed = None
+        self.stopped = False
         self.pid = None
         self.fd = None
         self.buf = b""
@@ -363,6 +374,8 @@ def _consume(job, data):
         elif tag == "SETUP":
             secs, _, cls = rest.partition(" ")
             job.setup_cpu[cls] = float(secs)
+        elif tag == "STOPPED":
+            job.stopped = True
         elif tag == "DONE":
             job.done = True
         elif tag == "CRASH":
