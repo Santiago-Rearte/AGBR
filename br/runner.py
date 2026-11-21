@@ -268,6 +268,8 @@ def check_lazy_attributes(out, base_all, only):
                 getattr(module, attr)
             except BaseException as error:  # noqa: BLE001
                 out.write(f"IMPORTFAIL {name} {type(error).__name__}:{attr}\n")
+                if isinstance(error, BRTimeout):
+                    out.write("IMPORTHANG\n")
                 break
 
 
@@ -285,13 +287,25 @@ def child_main(spec, wfd):
         sys.path.insert(0, root)
         if spec.get("inline_pools", True):
             install_inline_pools()
-        for mod in spec.get("import_check", ()):
-            try:
-                importlib.import_module(mod)
-            except BaseException as error:  # noqa: BLE001
-                out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
         if spec.get("import_check"):
-            check_lazy_attributes(out, spec.get("lazy_all", {}), set(spec["import_check"]))
+            # A patched import can also hang (an infinite loop in code run at import
+            # time): bound it, and confirm completion so the parent can tell.
+            signal.signal(signal.SIGALRM, _alarm)
+            signal.setitimer(signal.ITIMER_REAL, spec.get("import_timeout", 20.0))
+            try:
+                for mod in spec["import_check"]:
+                    try:
+                        importlib.import_module(mod)
+                    except BaseException as error:  # noqa: BLE001
+                        out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
+                        if isinstance(error, BRTimeout):
+                            out.write("IMPORTHANG\n")
+                            break
+                check_lazy_attributes(out, spec.get("lazy_all", {}), set(spec["import_check"]))
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            out.write("IMPORTSOK\n")
+            out.flush()
         if spec.get("mode", "unittest") == "unittest":
             run_unittest(
                 spec["nodeids"],
@@ -361,6 +375,8 @@ class Job:
         self.done = False
         self.crashed = None
         self.stopped = False
+        self.imports_ok = False
+        self.import_hang = False
         self.pid = None
         self.fd = None
         self.buf = b""
@@ -393,6 +409,10 @@ def _consume(job, data):
         elif tag == "SETUP":
             secs, _, cls = rest.partition(" ")
             job.setup_cpu[cls] = float(secs)
+        elif tag == "IMPORTHANG":
+            job.import_hang = True
+        elif tag == "IMPORTSOK":
+            job.imports_ok = True
         elif tag == "STOPPED":
             job.stopped = True
         elif tag == "DONE":

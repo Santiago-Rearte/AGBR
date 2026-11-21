@@ -275,7 +275,13 @@ class Analyzer:
         return b
 
     def reads(self, rel):
-        return self.m["reads"].get(rel, 0)
+        bits = self.m["reads"].get(rel, 0)
+        if rel.startswith("tests/") and rel.endswith(".py") and "/fixtures/" not in rel:
+            # pytest reads every test module's own source while collecting it (assert
+            # rewriting), which would make each test a "reader" of its own file.  Its
+            # own tests are covered by line coverage of the changed statement instead.
+            bits &= ~self.m["by_file"].get(rel, 0)
+        return bits
 
     def dirs(self, rel_dir):
         return self.m["dirs"].get(rel_dir.rstrip("/"), 0)

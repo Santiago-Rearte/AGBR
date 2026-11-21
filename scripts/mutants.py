@@ -106,7 +106,11 @@ def main():
     heavy = sorted(set(tests) - set(light))
     print(f"ground truth over {len(light)} tests; skipped heavy: {heavy}", flush=True)
     # Only mutate lines some test executes, otherwise nothing can fail.
-    files = [f for f in maps["lines"] if f.startswith("sqlglot/") and f.endswith(".py")]
+    scope = os.environ.get("BR_MUT_SCOPE", "sqlglot")
+    if scope == "tests":
+        files = [f for f in maps["lines"] if f.startswith("tests/") and f.split("/")[-1].startswith("test_") and f.endswith(".py")]
+    else:
+        files = [f for f in maps["lines"] if f.startswith("sqlglot/") and f.endswith(".py")]
     an = analysis.Analyzer(maps, REPO)
     runner.warm_imports(["duckdb", "pandas", "numpy"])
     os.environ.setdefault("PYTHON_CPU_COUNT", "2")
@@ -137,7 +141,7 @@ def main():
             mods = [m for m in mods if m and m.startswith("sqlglot")]
             chk = runner.Job("chk", {"root": root, "nodeids": [], "import_check": mods, "lazy_all": maps.get("lazy_all", {})}, 120)
             runner.run_jobs([chk], parallel=1)
-            if chk.import_failed or not chk.done:
+            if chk.import_failed or not chk.done or not chk.imports_ok or chk.import_hang:
                 import_failed = True
                 cands = set(tests)
         t0 = time.monotonic()

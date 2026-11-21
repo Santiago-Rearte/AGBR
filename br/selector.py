@@ -516,7 +516,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
         }
-        budget = 20.0 + sum(timeouts.values())
+        budget = 20.0 + sum(timeouts.values()) + (25.0 if p.modules else 0.0)
         spec = {
             "root": root,
             "nodeids": nodeids,
@@ -544,6 +544,11 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             f"{p.commit}: verified {len(job.passed)}/{len(p.run)} pass, cpu={job.cpu:.2f}s wall={job.wall:.2f}s"
             f" done={job.done} crash={job.crashed}"
         )
+        if job.spec.get("import_check") and (not job.imports_ok or job.import_hang):
+            # The import check itself crashed, hung or was killed: assume the patched
+            # code breaks every importer.
+            log(f"{p.commit}: import check did not complete, selecting everything")
+            p.extra |= set(id2num.values())
         for mod in job.import_failed:
             rel = mod.replace(".", "/")
             rel = rel + ".py" if os.path.exists(os.path.join(REPO, rel + ".py")) else rel + "/__init__.py"
