@@ -44,6 +44,7 @@ PROBES = os.environ.get("BR_PROBES", "1") == "1"
 DIVERSE_PROBES = int(os.environ.get("BR_DIVERSE_PROBES", "15"))
 PROBES_PER_HEAVY = int(os.environ.get("BR_PROBES_PER_HEAVY", "6"))
 MIN_PROBES = int(os.environ.get("BR_MIN_PROBES", "3"))
+UNIQUE_MAX = float(os.environ.get("BR_UNIQUE_MAX", "0.005"))
 
 
 def log(*args):
@@ -285,19 +286,40 @@ _ELIGIBLE = None
 
 
 def probe_eligible(maps):
-    """Heavy tests whose outcome does not depend on SQL content: they read no fixture
-    files and never run the parser (e.g. a generator memory check).  Content-driven
-    heavy tests can fail on one changed table entry that no cheap test exercises, so
-    they are never gated by probes."""
+    """Heavy tests that may be gated by probes.
+
+    Content-independent ones (no fixture reads, never run the parser, e.g. a generator
+    memory check) always qualify.  Content-driven ones qualify only when nearly every
+    sqlglot line they run is also run by some other test (UNIQUE_MAX): a heavy test
+    with its own private code paths (e.g. one that types every SQL function) can fail
+    on a changed table entry that no cheap test exercises."""
     global _ELIGIBLE
+    if _ELIGIBLE is None and os.environ.get("BR_PROBE_ALL") == "1":  # dev: measure risk
+        _ELIGIBLE = (1 << len(maps["tests"])) - 1
     if _ELIGIBLE is None:
+        n = len(maps["tests"])
         content = 0
         for rel, b in maps["reads"].items():
             if rel.startswith("tests/fixtures/"):
                 content |= b
         for sid in set((maps["lines"].get("sqlglot/parser.py") or {}).values()):
             content |= maps["sets"][sid]
-        _ELIGIBLE = ((1 << len(maps["tests"])) - 1) & ~content
+        eligible = ((1 << n) - 1) & ~content
+        if UNIQUE_MAX > 0:
+            slow = [i for i, d in enumerate(maps["dur"]) if d >= HEAVY_SEC and content >> i & 1]
+            uses = {}
+            for rel, lines in maps["lines"].items():
+                if rel.startswith("sqlglot/"):
+                    for sid in lines.values():
+                        uses[sid] = uses.get(sid, 0) + 1
+            sets = maps["sets"]
+            for h in slow:
+                bit = 1 << h
+                total = sum(c for sid, c in uses.items() if sets[sid] & bit)
+                own = sum(c for sid, c in uses.items() if sets[sid] == bit)
+                if total and own <= UNIQUE_MAX * total:
+                    eligible |= bit
+        _ELIGIBLE = eligible
     return _ELIGIBLE
 
 
