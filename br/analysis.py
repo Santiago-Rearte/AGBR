@@ -20,6 +20,7 @@ BLOCK_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
 PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"}
 KEY_REFINE = os.environ.get("BR_KEY_REFINE", "1") == "1"
 SETUP_REFINE = os.environ.get("BR_SETUP_REFINE", "1") == "1"
+DATA_SITES = os.environ.get("BR_DATA_SITES", "1") == "1"  # see analyze()
 KEYS_PATH = os.path.join(os.environ.get("BR_MAPS", "/opt/maps"), "keys.pkl")
 
 
@@ -1163,7 +1164,12 @@ class Analyzer:
             static |= st
             self.trace.setdefault("per_file", []).append((fp.path, b, note))
             notes.append(f"{fp.path}:{note}")
-            if not (note.startswith("sites=") or note in ("noop", "mode")):
+            if note == "data" and DATA_SITES:
+                # Data files only add their readers (kept selected by the selector);
+                # they do not stop the code part's sites from being analysed as such.
+                self.trace["other"] = True
+                self.trace["data"] = True
+            elif not (note.startswith("sites=") or note in ("noop", "mode")):
                 self.trace["other"] = True
                 self.trace["nonsite"] = True
         return bits, notes, static

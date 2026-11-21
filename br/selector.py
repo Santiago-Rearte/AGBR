@@ -73,6 +73,7 @@ MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot line
 # setup loaded from it are verified on just the changed items of those lists.
 SLICE = os.environ.get("BR_SLICE", "1") == "1"
 SLICE_MIN_SEC = float(os.environ.get("BR_SLICE_MIN_SEC", "1.0"))
+SPLIT_PRIOR = os.environ.get("BR_SPLIT_PRIOR", "1") == "1"  # data + code patches
 
 
 def log(*args):
@@ -125,6 +126,7 @@ class Plan:
         self.check_imports = False
         self.keyref = []  # key-level refinements, each with its unrefined fallback
         self.sliced = {}  # heavy test -> (class key, {attr: base item fingerprints})
+        self.mixed = False  # data and code changes together
 
 
 def main():
@@ -227,8 +229,15 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             if plan.keyref:
                 plan.notes.append("keys(" + ",".join(f"{k['attr']}:{len(k['keys'])}" for k in plan.keyref) + ")")
             cands = {idx2num[i] for i in analysis.iter_bits(bits) if idx2num[i] >= 0}
+            # Readers of changed data files: selected (or sliced) for the data change
+            # itself, never gated by the code part's dominance or probes.
+            data_bits = 0
+            for _rel, b, note in an.trace.get("per_file") or ():
+                if note == "data":
+                    data_bits |= b
+            data_cands = {idx2num[i] for i in analysis.iter_bits(data_bits) if idx2num[i] >= 0} & cands
             if not static and DOMINANCE:
-                dom = dominated_heavy(an, bits, idx_sec, cheap_all)
+                dom = dominated_heavy(an, bits & ~data_bits, idx_sec, cheap_all)
                 plan.dominated = {idx2num[i] for i in analysis.iter_bits(dom) if idx2num[i] >= 0}
             if unknown and any(fp.path.endswith(".py") for fp in fps):
                 static = True if len(unknown) > 50 else static
@@ -241,7 +250,25 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             plan.fail_prior = DATA_FAIL_PRIOR if data_change else FAIL_PRIOR
             if SLICE and VERIFY and data_change and not static and plan.files is not None:
                 plan.sliced = plan_slices(an, maps, cands, idx2num, num2id, sec, verifiable, file_of)
-            decide(plan, cands - set(plan.sliced), static, verifiable, num2id, sec, pool_nums, file_of)
+            fixed_data = set()
+            if data_change and not static:
+                fixed_data = data_cands - set(plan.sliced)
+                if SPLIT_PRIOR and cands - data_cands - set(plan.sliced):
+                    # Data and code changes together: the data readers are selected as
+                    # for a data change, the code change's own candidates are decided
+                    # with the code failure prior.
+                    plan.static |= fixed_data
+                    plan.fail_prior = FAIL_PRIOR
+                    plan.mixed = True
+                    plan.notes.append(f"split({len(fixed_data)})")
+                    decide(plan, cands - set(plan.sliced) - fixed_data, static, verifiable, num2id, sec, pool_nums, file_of)
+                else:
+                    decide(plan, cands - set(plan.sliced), static, verifiable, num2id, sec, pool_nums, file_of)
+            else:
+                decide(plan, cands - set(plan.sliced), static, verifiable, num2id, sec, pool_nums, file_of)
+            plan.static -= fixed_data  # (kept out of the probes; added back below)
+            plan.dominated -= fixed_data
+            plan.conditional -= fixed_data
             runtime_only = bool(an.trace.get("runtime")) and not an.trace.get("other")
             if PROBES and VERIFY and not static and not an.trace.get("nonsite") and (
                 an.trace.get("import") or (PROBES_RUNTIME and runtime_only)
@@ -255,6 +282,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
                     elif pack(plan.static, dur_ms)[0] / 1000.0 >= PROBE_DROP_RT_MIN:
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus, limit=PROBE_DROP_RT_N)
+            if fixed_data:
+                # (never left to probes: the data change alone makes them fail)
+                plan.conditional -= fixed_data
+                plan.static |= fixed_data - plan.run
             if plan.sliced:
                 plan.run |= set(plan.sliced)
                 plan.static -= set(plan.sliced)
@@ -271,6 +302,12 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
         log(
             f"{c}: cand={len(plan.static) + len(plan.run)} run={len(plan.run)} static={len(plan.static)}"
             f" ({time.monotonic() - t0:.2f}s) {' '.join(plan.notes)[:200]}"
+            + "".join(
+                f" HEAVY-{kind}:{num2id[n].rsplit('::', 1)[-1]}"
+                for kind, group in (("run", plan.run), ("static", plan.static), ("cond", plan.conditional))
+                for n in sorted(group)
+                if sec.get(n, 0) >= 2.0
+            )
         )
 
     jobs = [p for p in plans if p.run or (p.check_imports and p.modules)]
@@ -452,8 +489,8 @@ def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None, limit=N
         probes |= set(ranked[:FOCUS_PROBES])
     if not probes:
         return
-    if PROBE_VERIFY:
-        # Exact variant: the cheap verifiable remainder is run too (stopping at the
+    if PROBE_VERIFY or plan.mixed:
+        # Exact variant (always for data + code patches): the cheap verifiable remainder is run too (stopping at the
         # first failure) instead of being dropped when the probes pass, unless that
         # costs more CPU than PROBE_VERIFY_MAX; heavy or unverifiable tests stay
         # conditional either way.
