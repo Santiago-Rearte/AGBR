@@ -54,6 +54,8 @@ PROBE_VERIFY = os.environ.get("BR_PROBE_VERIFY", "1") == "1"
 PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU seconds (calibrated)
 LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
+HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
+HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
 RT_DROP_RUN = os.environ.get("BR_RT_DROP_RUN", "0") == "1"
 RT_DROP_MIN_RUN = int(os.environ.get("BR_RT_DROP_MIN_RUN", "20"))
 KEEP_RATIO = float(os.environ.get("BR_KEEP_RATIO", "2.0"))  # neighbours run when cheaper than this x heavy
@@ -346,8 +348,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             if p.conditional and live:
                 ok = PER_HEAVY and job is not None and job.done and not job.crashed
                 ok = ok and not job.collect_failed and not job.import_failed
+                done_ok = job is not None and job.done and not job.crashed and not job.collect_failed
+                done_ok = done_ok and not job.import_failed
                 for h in p.conditional:
-                    if h in p.phase2 and ok and num2id[h] in passed:
+                    if h in p.phase2 and done_ok and num2id[h] in passed:
                         continue  # verified in the second pass
                     nb = p.cond_near.get(h) if ok else None
                     if not nb or not is_strict(h) or any(num2id[x] not in passed for x in nb):
@@ -846,6 +850,14 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             for _n, (key, attrs) in sorted(p.sliced.items()):
                 spec_slices.setdefault(key, {}).update(attrs)
         tcpu = CALIB.get("test_cpu", {})
+        if HEAVY_VERIFY and p.conditional:
+            # Gated heavy tests: verified once the change is found live (a failure),
+            # stopping at their first failing subtest, instead of selected unverified.
+            ok_ids = set(CALIB.get("passed") or ())
+            for h in p.conditional:
+                hid = num2id[h]
+                if sec[h] >= HEAVY_SEC and hid in ok_ids and tcpu.get(hid, CPU_FACTOR * sec[h]) < HV_RATIO * sec[h]:
+                    p.phase2.add(h)
         phase2 = sorted(num2id[n] for n in p.phase2 & p.conditional)
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0)

@@ -113,6 +113,36 @@ def install_inline_pools():
     import concurrent.futures.process as cfp
     import pickle
 
+    class LazyFuture(cf.Future):
+        """Reports itself finished (as_completed/wait yield it at once) and computes
+        its result on first request."""
+
+        def __init__(self, thunk):
+            super().__init__()
+            self._thunk = thunk
+            self._br_ran = False
+            self._state = "FINISHED"
+
+        def _br_run(self):
+            if not self._br_ran:
+                self._br_ran = True
+                try:
+                    self._result = self._thunk()
+                except BRTimeout:
+                    raise
+                except BaseException as error:  # noqa: BLE001
+                    self._exception = error
+
+        def result(self, timeout=None):
+            self._br_run()
+            if self._exception is not None:
+                raise self._exception
+            return self._result
+
+        def exception(self, timeout=None):
+            self._br_run()
+            return self._exception
+
     class InlineProcessPoolExecutor(cf.Executor):
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_kw):
             self._initializer = initializer
@@ -120,6 +150,20 @@ def install_inline_pools():
             self._ready = False
 
         def submit(self, fn, /, *args, **kwargs):
+            if LAZY_POOLS:
+                # Runs when its result is asked for (a test checking results one by
+                # one then stops at the first wrong one without computing the rest).
+                if not self._ready:
+                    self._ready = True
+                    if self._initializer is not None:
+                        self._initializer(*pickle.loads(pickle.dumps(self._initargs)))
+                packed = pickle.dumps((fn, args, kwargs))
+
+                def thunk():
+                    fn2, args2, kwargs2 = pickle.loads(packed)
+                    return pickle.loads(pickle.dumps(fn2(*args2, **kwargs2)))
+
+                return LazyFuture(thunk)
             future = cf.Future()
             try:
                 if not self._ready:
@@ -327,6 +371,9 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
             super().addSubTest(test, subtest, err)
             if err is not None:
                 self._bad(test)
+                if SUBTEST_ABORT:
+                    # One failing subtest fails the test: skip its remaining subtests.
+                    raise SubtestAbort("first failing subtest")
 
         def addSuccess(self, test):
             super().addSuccess(test)
@@ -403,6 +450,14 @@ def check_lazy_attributes(out, base_all, only):
                 if isinstance(error, BRTimeout):
                     out.write("IMPORTHANG\n")
                 break
+
+
+LAZY_POOLS = os.environ.get("BR_LAZY_POOLS", "1") == "1"
+SUBTEST_ABORT = os.environ.get("BR_SUBTEST_ABORT", "1") == "1"
+
+
+class SubtestAbort(Exception):
+    pass
 
 
 STATE_BASE = None  # keys.pkl content, set by the parent before forking
