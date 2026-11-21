@@ -43,5 +43,5 @@ RUN cd /opt/sqlglot && SKIP_INTEGRATION=0 PYTHON_CPU_COUNT=2 \
 # 6. Runtime selector (light layer).
 COPY br/selector.py br/analysis.py br/patchlib.py /opt/br/
 RUN python -m compileall -q /opt/br && chmod -R a+rX /opt/br
-ENV SKIP_INTEGRATION=0 BR_MIN_LINE_RATE=0 BR_UNIQUE_MAX=0.05 BR_MIN_CHEAP_COVER=2 BR_PROBE_DROP=1
+ENV SKIP_INTEGRATION=0 BR_MIN_LINE_RATE=0 BR_UNIQUE_MAX=0.05 BR_MIN_CHEAP_COVER=2 BR_PROBE_DROP=1 BR_HEAVY_SEC=1.0
 CMD ["python", "/opt/br/selector.py"]

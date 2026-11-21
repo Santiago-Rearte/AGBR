@@ -48,6 +48,9 @@ UNIQUE_MAX = float(os.environ.get("BR_UNIQUE_MAX", "0.005"))
 # High-variance rule: the static remainder of a class/module-level change is kept
 # only if one of a few diverse cheap probes fails.
 PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
+# Probe gating of heavy tests also for changes inside functions.
+PROBES_RUNTIME = os.environ.get("BR_PROBES_RUNTIME", "0") == "1"
+PROBE_DROP_RUNTIME = os.environ.get("BR_PROBE_DROP_RUNTIME", "0") == "1"
 PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
 MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot lines per traced second
 
@@ -208,12 +211,16 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             data_change = any(not fp.path.endswith(".py") for fp in fps)
             plan.fail_prior = DATA_FAIL_PRIOR if data_change else FAIL_PRIOR
             decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of)
-            if PROBES and VERIFY and not static and an.trace.get("import") and not an.trace.get("nonsite"):
+            runtime_only = bool(an.trace.get("runtime")) and not an.trace.get("other")
+            if PROBES and VERIFY and not static and not an.trace.get("nonsite") and (
+                an.trace.get("import") or (PROBES_RUNTIME and runtime_only)
+            ):
                 add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec)
-                if PROBE_DROP and not plan.keyref:
+                if PROBE_DROP and not plan.keyref and (an.trace.get("import") or PROBE_DROP_RUNTIME):
                     # (key-level selections are exact: one specific test may be the
                     # only one to fail, and no handful of probes would see it)
-                    probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
+                    focus = focus_tests(an, maps, idx2num) if not an.trace.get("import") else {}
+                    probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus)
             # Changed code that runs at import time can break the import of every
             # user; such patches always get an import check, even when nothing is run.
             if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
@@ -347,7 +354,31 @@ def probe_eligible(maps):
     return _ELIGIBLE
 
 
-def probe_drop(plan, maps, num2idx, num2id, verifiable, sec):
+FOCUS_PROBES = int(os.environ.get("BR_FOCUS_PROBES", "10"))
+
+
+def focus_tests(an, maps, idx2num):
+    """For changes inside functions: test number -> how many lines of the changed
+    functions it runs (the tests most specific to the changed code first)."""
+    counts = {}
+    for rel, _units, fspan in an.trace.get("runtime") or ():
+        lines = maps["lines"].get(rel) or {}
+        for ln in range(fspan[0], fspan[1] + 1):
+            sid = lines.get(ln)
+            if sid is None:
+                continue
+            b = maps["sets"][sid]
+            while b:
+                low = b & -b
+                i = low.bit_length() - 1
+                b ^= low
+                n = idx2num[i]
+                if n >= 0:
+                    counts[n] = counts.get(n, 0) + 1
+    return counts
+
+
+def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None):
     """Every statically selected test becomes conditional on a few diverse cheap
     probes (the cheapest verifiable test of each file): selected only when the
     verification run finds the change live."""
@@ -358,6 +389,9 @@ def probe_drop(plan, maps, num2idx, num2id, verifiable, sec):
     for n in sorted(pool, key=lambda n: (sec[n], n)):
         first.setdefault(num2id[n].split("::", 1)[0], n)
     probes = set(sorted(first.values(), key=lambda n: (sec[n], n))[:PROBE_DROP_N])
+    if focus:
+        ranked = sorted((n for n in pool if n in focus), key=lambda n: (-focus[n], sec[n], n))
+        probes |= set(ranked[:FOCUS_PROBES])
     if not probes:
         return
     rest = plan.static - probes
