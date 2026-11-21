@@ -30,8 +30,10 @@ FILE_OVERHEAD = float(os.environ.get("BR_FILE_OVERHEAD", "0.12"))
 POOL_OVERHEAD = float(os.environ.get("BR_POOL_OVERHEAD", "0.3"))
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.15"))
 FAIL_PRIOR = float(os.environ.get("BR_FAIL_PRIOR", "0.5"))
+DATA_FAIL_PRIOR = float(os.environ.get("BR_DATA_FAIL_PRIOR", "0.85"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+CALIB = {}
 
 
 def log(*args):
@@ -76,6 +78,7 @@ class Plan:
         self.modules = []  # patched sqlglot modules to import-check
         self.job = None
         self.notes = []
+        self.fail_prior = FAIL_PRIOR
 
 
 def main():
@@ -125,7 +128,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
     verifiable = set()
     try:
         with open(os.path.join(MAPS, "verifiable.json")) as fh:
-            verifiable = set(json.load(fh)["passed"])
+            calib = json.load(fh)
+        verifiable = set(calib["passed"])
+        CALIB.update(calib)
+        log(f"calibration: job overhead {CALIB.get('job_overhead', 0):.3f}s")
     except OSError:
         log("no verifiable.json: nothing will be verified")
 
@@ -164,6 +170,9 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             prepare_overlay(plan, fps, an, patchlib)
             if plan.files is None:
                 static = True
+            # A change to data a test reads almost always changes what it observes.
+            data_change = any(not fp.path.endswith(".py") for fp in fps)
+            plan.fail_prior = DATA_FAIL_PRIOR if data_change else FAIL_PRIOR
             decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of)
         except Exception:
             log(f"{c}: analysis crashed, selecting everything\n{traceback.format_exc()}")
@@ -231,22 +240,37 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
         plan.static = from_fixed | never
         return
 
+    test_cpu = CALIB.get("test_cpu", {})
+    collect_cpu = CALIB.get("collect_cpu", {})
+    setup_cpu = CALIB.get("setup_cpu", {})
+    overhead = CALIB.get("job_overhead", RUN_OVERHEAD)
+
+    def run_cost(n):
+        nid = num2id[n]
+        return test_cpu.get(nid, CPU_FACTOR * sec[n] + (POOL_OVERHEAD if n in pool_nums else 0.0))
+
+    runnable.sort(key=lambda n: (run_cost(n), n))
     best_cost = pack(cands | from_fixed, dur_ms)[0] / 1000.0
     best_j = 0
-    run_sum = 0.0
+    run_sum = overhead
     files = set()
-    uses_pool = False
+    classes = set()
     for j, n in enumerate(runnable, start=1):
-        run_sum += sec[n]
-        files.add(file_of[n])
-        uses_pool = uses_pool or n in pool_nums
+        nid = num2id[n]
+        run_sum += run_cost(n)
+        f = file_of[n]
+        if f not in files:
+            files.add(f)
+            run_sum += collect_cpu.get(f, FILE_OVERHEAD)
+        c = nid.rsplit("::", 1)[0]
+        if c not in classes:
+            classes.add(c)
+            run_sum += setup_cpu.get(c, 0.0)
         rest = never | set(runnable[j:]) | from_fixed
-        cost = RUN_OVERHEAD + FILE_OVERHEAD * len(files) + CPU_FACTOR * run_sum
-        cost += POOL_OVERHEAD if uses_pool else 0.0
-        if rest:
-            cost += pack(rest, dur_ms)[0] / 1000.0
-        else:
-            cost += FAIL_PRIOR * (WORKER_MS / 1000.0 + 0.05)
+        # With probability q something fails and the tests run here are selected too.
+        q = plan.fail_prior
+        cost = run_sum + (1.0 - q) * pack(rest, dur_ms)[0] / 1000.0
+        cost += q * pack(rest | set(runnable[:j]), dur_ms)[0] / 1000.0
         if cost < best_cost:
             best_cost, best_j = cost, j
     plan.run = set(runnable[:best_j])
@@ -274,7 +298,10 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     for p in plans:
         root = os.path.join(WORK, p.commit)
         nodeids = sorted((num2id[n] for n in p.run), key=lambda i: i)
-        timeouts = {num2id[n]: max(3.0, 6.0 * sec[n] + 2.0) for n in p.run}
+        tcpu = CALIB.get("test_cpu", {})
+        timeouts = {
+            num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
+        }
         budget = 20.0 + sum(timeouts.values())
         spec = {"root": root, "nodeids": nodeids, "timeouts": timeouts, "import_check": p.modules}
         job = runner.Job(p.commit, spec, budget)
@@ -304,6 +331,14 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             f = nodeid.split("::", 1)[0]
             p.extra |= {n for i, n in id2num.items() if i.split("::", 1)[0] == f}
 
+    # Children are forked from this process: drop the analysis caches (ASTs of big
+    # modules, the source corpus) and freeze what is left, so the children's garbage
+    # collector does not touch, and copy, the parent's heap.
+    import gc
+
+    an.release()
+    gc.collect()
+    gc.freeze()
     runner.run_jobs(jobs, parallel=PARALLEL, setup=setup, cleanup=cleanup)
 
 

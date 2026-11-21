@@ -198,6 +198,13 @@ class Analyzer:
         self.mod_classes = maps.get("mod_classes", {})
         self.eager = set(maps.get("eager", ()))
 
+    def release(self):
+        """Forgets cached ASTs and sources (they are rebuilt on demand)."""
+        self._ast.clear()
+        self._src.clear()
+        self._corpus = None
+        self._memo.clear()
+
     # -- primitive lookups --------------------------------------------------
 
     def source(self, rel):

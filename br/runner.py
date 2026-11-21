@@ -70,14 +70,23 @@ class Reporter:
         self.default_timeout = default_timeout
         self.bad = set()
         self.ok = set()
+        self.t_test = 0.0
+        self.t_collect = {}
+
+    def pytest_collectstart(self, collector):
+        self.t_collect[collector.nodeid] = _cpu()
 
     def pytest_collectreport(self, report):
         if report.failed:
             self.out.write(f"COLLECTFAIL {report.nodeid}\n")
+        t = self.t_collect.pop(report.nodeid, None)
+        if t is not None and report.nodeid.endswith(".py"):
+            self.out.write(f"COLL {_cpu() - t:.4f} {report.nodeid}\n")
 
     def pytest_runtest_protocol(self, item, nextitem):
         signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(item.nodeid, self.default_timeout))
+        self.t_test = _cpu()
 
     def pytest_runtest_logreport(self, report):
         if report.failed or report.skipped:
@@ -87,8 +96,14 @@ class Reporter:
 
     def pytest_runtest_logfinish(self, nodeid, location):
         signal.setitimer(signal.ITIMER_REAL, 0)
+        self.out.write(f"CPU {_cpu() - self.t_test:.4f} {nodeid}\n")
         if nodeid in self.ok and nodeid not in self.bad:
             self.out.write(f"PASS {nodeid}\n")
+
+
+def _cpu():
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
 
 
 def install_inline_pools():
@@ -130,6 +145,111 @@ def install_inline_pools():
     cf.ProcessPoolExecutor = InlineProcessPoolExecutor
 
 
+def run_unittest(nodeids, out, timeouts, default_timeout):
+    """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
+    collection cost.  Class and module fixtures are handled by unittest.TestSuite."""
+    import unittest
+
+    by_id = {}
+    tests = []
+    files = {}
+    for nid in nodeids:
+        f, _, rest = nid.partition("::")
+        files.setdefault(f, []).append((rest, nid))
+    for f, items in files.items():
+        modname = f[:-3].replace("/", ".")
+        t0 = _cpu()
+        try:
+            module = importlib.import_module(modname)
+        except BaseException as error:  # noqa: BLE001
+            out.write(f"COLLECTFAIL {f} {type(error).__name__}\n")
+            continue
+        out.write(f"COLL {_cpu() - t0:.4f} {f}\n")
+        for rest, nid in items:
+            cls_name, _, meth = rest.partition("::")
+            cls = getattr(module, cls_name, None)
+            if not (isinstance(cls, type) and issubclass(cls, unittest.TestCase) and hasattr(cls, meth)):
+                out.write(f"NOTUNIT {nid}\n")
+                continue
+            test = cls(meth)
+            by_id[test.id()] = nid
+            tests.append(test)
+
+    class Result(unittest.TestResult):
+        def __init__(self):
+            super().__init__()
+            self.bad = set()
+            self.ok = set()
+            self.t0 = 0.0
+            self.t_end = _cpu()
+            self.cls = None
+
+        def _nid(self, test):
+            return by_id.get(test.id()) if hasattr(test, "id") else None
+
+        def startTest(self, test):
+            super().startTest(test)
+            nid = self._nid(test)
+            now = _cpu()
+            cls = nid.rsplit("::", 1)[0] if nid else None
+            if cls is not None and cls != self.cls:
+                # Time since the previous test went to class/module set-up of this one.
+                out.write(f"SETUP {now - self.t_end:.4f} {cls}\n")
+                self.cls = cls
+            signal.signal(signal.SIGALRM, _alarm)
+            signal.setitimer(signal.ITIMER_REAL, timeouts.get(nid, default_timeout))
+            self.t0 = _cpu()
+
+        def stopTest(self, test):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            super().stopTest(test)
+            self.t_end = _cpu()
+            nid = self._nid(test)
+            if nid is None:
+                return
+            out.write(f"CPU {self.t_end - self.t0:.4f} {nid}\n")
+            if nid in self.ok and nid not in self.bad:
+                out.write(f"PASS {nid}\n")
+
+        def _bad(self, test):
+            nid = self._nid(test)
+            if nid is not None:
+                self.bad.add(nid)
+
+        def addError(self, test, err):
+            super().addError(test, err)
+            self._bad(test)
+
+        def addFailure(self, test, err):
+            super().addFailure(test, err)
+            self._bad(test)
+
+        def addSkip(self, test, reason):
+            super().addSkip(test, reason)
+            self._bad(test)
+
+        def addExpectedFailure(self, test, err):
+            super().addExpectedFailure(test, err)
+            self._bad(test)
+
+        def addUnexpectedSuccess(self, test):
+            super().addUnexpectedSuccess(test)
+            self._bad(test)
+
+        def addSubTest(self, test, subtest, err):
+            super().addSubTest(test, subtest, err)
+            if err is not None:
+                self._bad(test)
+
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            nid = self._nid(test)
+            if nid is not None:
+                self.ok.add(nid)
+
+    unittest.TestSuite(tests).run(Result())
+
+
 def child_main(spec, wfd):
     try:
         os.setpgid(0, 0)
@@ -149,6 +269,11 @@ def child_main(spec, wfd):
                 importlib.import_module(mod)
             except BaseException as error:  # noqa: BLE001
                 out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
+        if spec.get("mode", "unittest") == "unittest":
+            run_unittest(spec["nodeids"], out, spec.get("timeouts", {}), spec.get("default_timeout", 30.0))
+            out.write("DONE\n")
+            out.flush()
+            os._exit(0)
         import pytest
 
         reporter = Reporter(out, spec.get("timeouts", {}), spec.get("default_timeout", 30.0))
@@ -212,6 +337,9 @@ class Job:
         self.deadline = None
         self.cpu = 0.0
         self.wall = 0.0
+        self.test_cpu = {}
+        self.collect_cpu = {}
+        self.setup_cpu = {}
 
 
 def _consume(job, data):
@@ -226,6 +354,15 @@ def _consume(job, data):
             job.collect_failed.add(rest)
         elif tag == "IMPORTFAIL":
             job.import_failed.add(rest.split(" ", 1)[0])
+        elif tag == "CPU":
+            secs, _, nodeid = rest.partition(" ")
+            job.test_cpu[nodeid] = float(secs)
+        elif tag == "COLL":
+            secs, _, nodeid = rest.partition(" ")
+            job.collect_cpu[nodeid.split(" ", 1)[0]] = float(secs)
+        elif tag == "SETUP":
+            secs, _, cls = rest.partition(" ")
+            job.setup_cpu[cls] = float(secs)
         elif tag == "DONE":
             job.done = True
         elif tag == "CRASH":
@@ -346,12 +483,28 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         passed |= job.passed
         if job.collect_failed or job.crashed or not job.done:
             log(f"  calibration job {job.key}: done={job.done} crash={job.crashed} collect={sorted(job.collect_failed)[:3]}")
+    test_cpu, collect_cpu, setup_cpu = {}, {}, {}
+    for job in jobs:
+        test_cpu.update(job.test_cpu)
+        collect_cpu.update(job.collect_cpu)
+        setup_cpu.update(job.setup_cpu)
+    # Fixed cost of one verification job: fork, pytest start-up, an empty session.
+    first = sorted(tests_list)[0]
+    probe = [Job(f"probe{i}", {"root": repo, "nodeids": [first], "default_timeout": 60.0}, 120.0) for i in range(3)]
+    run_jobs(probe, parallel=1)
+    overheads = sorted(
+        j.cpu - sum(j.test_cpu.values()) - sum(j.collect_cpu.values()) - sum(j.setup_cpu.values()) for j in probe
+    )
     failed = sorted(set(tests_list) - passed)
     log(f"calibration: {len(passed)} pass, {len(failed)} not verifiable, {time.monotonic() - t0:.1f}s")
     for t in failed[:30]:
         log(f"  not verifiable: {t}")
     with open(out_path, "w") as fh:
-        json.dump({"passed": sorted(passed)}, fh)
+        json.dump(
+            {"passed": sorted(passed), "test_cpu": test_cpu, "collect_cpu": collect_cpu, "setup_cpu": setup_cpu, "job_overhead": overheads[1]},
+            fh,
+        )
+    log(f"job overhead {overheads}, collect total {sum(collect_cpu.values()):.2f}s, test cpu total {sum(test_cpu.values()):.2f}s")
 
 
 if __name__ == "__main__":
