@@ -258,6 +258,13 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
             if nid is not None:
                 self.ok.add(nid)
 
+    if GC_FREEZE:
+        # Everything imported so far (sqlglot, the test modules, their dialects) is
+        # long-lived: freeze it, so full collections inside tests (memory checks
+        # call gc.collect() dozens of times) only walk what the tests create.
+        import gc
+
+        gc.freeze()
     first = Result()
     unittest.TestSuite(tests).run(first)
     # (When nothing passed before the first failure the change breaks everything it
@@ -312,6 +319,7 @@ def check_lazy_attributes(out, base_all, only):
 
 
 STATE_BASE = None  # keys.pkl content, set by the parent before forking
+GC_FREEZE = os.environ.get("BR_GC_FREEZE", "1") == "1"
 
 
 def check_state(out, sc):

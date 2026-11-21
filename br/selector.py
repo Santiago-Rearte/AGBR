@@ -51,10 +51,12 @@ PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
 # Probe gating of heavy tests also for changes inside functions.
 PROBES_RUNTIME = os.environ.get("BR_PROBES_RUNTIME", "0") == "1"
 PROBE_DROP_RUNTIME = os.environ.get("BR_PROBE_DROP_RUNTIME", "0") == "1"
+PROBE_DROP_KEYS = os.environ.get("BR_PROBE_DROP_KEYS", "0") == "1"  # also key-level selections
 # A gated heavy test that meets the strict criteria (STRICT_UNIQUE, STRICT_LINE_RATE)
 # is selected only when one of its own coverage neighbours fails, not whenever any
 # verified test fails.
 PER_HEAVY = os.environ.get("BR_PER_HEAVY", "0") == "1"
+PER_HEAVY_ALL = os.environ.get("BR_PER_HEAVY_ALL", "0") == "1"  # every eligible heavy test
 STRICT_UNIQUE = 0.005
 STRICT_LINE_RATE = 100.0
 PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
@@ -229,7 +231,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                 an.trace.get("import") or (PROBES_RUNTIME and runtime_only)
             ):
                 add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec)
-                if PROBE_DROP and not plan.keyref and (an.trace.get("import") or PROBE_DROP_RUNTIME):
+                if PROBE_DROP and (not plan.keyref or PROBE_DROP_KEYS) and (an.trace.get("import") or PROBE_DROP_RUNTIME):
                     # (key-level selections are exact: one specific test may be the
                     # only one to fail, and no handful of probes would see it)
                     focus = focus_tests(an, maps, idx2num) if not an.trace.get("import") else {}
@@ -493,6 +495,8 @@ _NEAR = {"num2idx": {}}
 def is_strict(n):
     """Heavy test (number) meeting the strict probe criteria."""
     i = _NEAR["num2idx"].get(n)
+    if i is not None and PER_HEAVY_ALL:
+        return (_ELIGIBLE or 0) >> i & 1 == 1
     return i is not None and (_STRICT >> i) & 1 == 1
 
 
