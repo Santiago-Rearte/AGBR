@@ -1,0 +1,363 @@
+"""Runs candidate tests against a patched tree in forked children.
+
+A test counts as verified only when pytest reported its call phase as passed and
+no report for it (setup, call, teardown, subtests) failed or was skipped.  Every
+other candidate stays selected, so a crash, a timeout or a collection error can
+only make a selection bigger.
+"""
+
+import importlib
+import json
+import os
+import selectors
+import shutil
+import signal
+import sys
+import time
+
+DEVNULL = os.open(os.devnull, os.O_RDWR)
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Overlay trees: symlinks to the base checkout, real files only where patched.
+
+
+def make_overlay(dst, src, files, deleted=()):
+    paths = set(files) | set(deleted)
+    dirs = {""}
+    for rel in paths:
+        parts = rel.split("/")
+        for k in range(1, len(parts)):
+            dirs.add("/".join(parts[:k]))
+    for d in sorted(dirs, key=lambda x: (x.count("/"), x)):
+        target = os.path.join(dst, d) if d else dst
+        os.makedirs(target, exist_ok=True)
+        srcdir = os.path.join(src, d) if d else src
+        try:
+            names = os.listdir(srcdir)
+        except OSError:
+            names = []
+        for name in names:
+            rel = f"{d}/{name}" if d else name
+            if rel in dirs or rel in paths:
+                continue
+            os.symlink(os.path.join(src, rel), os.path.join(dst, rel))
+    for rel, data in files.items():
+        with open(os.path.join(dst, rel), "wb") as fh:
+            fh.write(data)
+
+
+# ---------------------------------------------------------------------------
+# Child side.
+
+
+class BRTimeout(BaseException):
+    pass
+
+
+def _alarm(signum, frame):
+    raise BRTimeout("test exceeded its time budget")
+
+
+class Reporter:
+    def __init__(self, out, timeouts, default_timeout):
+        self.out = out
+        self.timeouts = timeouts
+        self.default_timeout = default_timeout
+        self.bad = set()
+        self.ok = set()
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.out.write(f"COLLECTFAIL {report.nodeid}\n")
+
+    def pytest_runtest_protocol(self, item, nextitem):
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, self.timeouts.get(item.nodeid, self.default_timeout))
+
+    def pytest_runtest_logreport(self, report):
+        if report.failed or report.skipped:
+            self.bad.add(report.nodeid)
+        elif report.when == "call" and report.passed:
+            self.ok.add(report.nodeid)
+
+    def pytest_runtest_logfinish(self, nodeid, location):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if nodeid in self.ok and nodeid not in self.bad:
+            self.out.write(f"PASS {nodeid}\n")
+
+
+def install_inline_pools():
+    """Process pools run tasks in this process, with arguments and results still
+    round-tripped through pickle as a spawned worker would see them."""
+    import concurrent.futures as cf
+    import concurrent.futures.process as cfp
+    import pickle
+
+    class InlineProcessPoolExecutor(cf.Executor):
+        def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_kw):
+            self._initializer = initializer
+            self._initargs = initargs
+            self._ready = False
+
+        def submit(self, fn, /, *args, **kwargs):
+            future = cf.Future()
+            try:
+                if not self._ready:
+                    self._ready = True
+                    if self._initializer is not None:
+                        self._initializer(*pickle.loads(pickle.dumps(self._initargs)))
+                fn2, args2, kwargs2 = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                result = fn2(*args2, **kwargs2)
+                future.set_result(pickle.loads(pickle.dumps(result)))
+            except BRTimeout:
+                raise
+            except BaseException as error:  # noqa: BLE001
+                future.set_exception(error)
+            return future
+
+        def map(self, fn, *iterables, timeout=None, chunksize=1):
+            return [self.submit(fn, *args).result() for args in zip(*iterables)]
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            pass
+
+    cfp.ProcessPoolExecutor = InlineProcessPoolExecutor
+    cf.ProcessPoolExecutor = InlineProcessPoolExecutor
+
+
+def child_main(spec, wfd):
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+    os.dup2(DEVNULL, 0)
+    os.dup2(DEVNULL, 1)
+    out = os.fdopen(wfd, "w", buffering=1)
+    try:
+        root = spec["root"]
+        os.chdir(root)
+        sys.path.insert(0, root)
+        if spec.get("inline_pools", True):
+            install_inline_pools()
+        for mod in spec.get("import_check", ()):
+            try:
+                importlib.import_module(mod)
+            except BaseException as error:  # noqa: BLE001
+                out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
+        import pytest
+
+        reporter = Reporter(out, spec.get("timeouts", {}), spec.get("default_timeout", 30.0))
+        args = list(spec["nodeids"]) + [
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            root,
+            "-o",
+            "addopts=",
+            "--assert=plain",
+        ]
+        pytest.main(args, plugins=[reporter])
+        out.write("DONE\n")
+        out.flush()
+    except BaseException as error:  # noqa: BLE001
+        try:
+            out.write(f"CRASH {type(error).__name__}\n")
+            out.flush()
+        except Exception:
+            pass
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Parent side.
+
+
+def warm_imports(extra_modules=()):
+    """Imports pytest and its built-in plugins once, before any fork."""
+    os.environ.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    import pytest  # noqa: F401
+    from _pytest.config import default_plugins
+
+    for name in default_plugins:
+        try:
+            importlib.import_module(f"_pytest.{name}")
+        except Exception:
+            pass
+    for mod in extra_modules:
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            pass
+
+
+class Job:
+    def __init__(self, key, spec, budget):
+        self.key = key
+        self.spec = spec
+        self.budget = budget
+        self.passed = set()
+        self.collect_failed = set()
+        self.import_failed = set()
+        self.done = False
+        self.crashed = None
+        self.pid = None
+        self.fd = None
+        self.buf = b""
+        self.deadline = None
+        self.cpu = 0.0
+        self.wall = 0.0
+
+
+def _consume(job, data):
+    job.buf += data
+    *lines, job.buf = job.buf.split(b"\n")
+    for raw in lines:
+        line = raw.decode("utf-8", "replace")
+        tag, _, rest = line.partition(" ")
+        if tag == "PASS":
+            job.passed.add(rest)
+        elif tag == "COLLECTFAIL":
+            job.collect_failed.add(rest)
+        elif tag == "IMPORTFAIL":
+            job.import_failed.add(rest.split(" ", 1)[0])
+        elif tag == "DONE":
+            job.done = True
+        elif tag == "CRASH":
+            job.crashed = rest
+
+
+def run_jobs(jobs, parallel=2, setup=None, cleanup=None):
+    """Runs every job in a forked child, at most `parallel` at a time."""
+    pending = list(jobs)
+    active = {}
+    sel = selectors.DefaultSelector()
+
+    def start(job):
+        if setup:
+            setup(job)
+        r, w = os.pipe()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            try:
+                sel.close()
+            except Exception:
+                pass
+            child_main(job.spec, w)
+        os.close(w)
+        job.pid, job.fd = pid, r
+        job.deadline = time.monotonic() + job.budget
+        job.wall = time.monotonic()
+        os.set_blocking(r, False)
+        sel.register(r, selectors.EVENT_READ, job)
+        active[pid] = job
+
+    def finish(job, kill=False):
+        if kill:
+            try:
+                os.killpg(job.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    os.kill(job.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        try:
+            sel.unregister(job.fd)
+        except Exception:
+            pass
+        try:
+            while True:
+                data = os.read(job.fd, 65536)
+                if not data:
+                    break
+                _consume(job, data)
+        except OSError:
+            pass
+        os.close(job.fd)
+        _, status, usage = os.wait4(job.pid, 0)
+        job.cpu = usage.ru_utime + usage.ru_stime
+        job.wall = time.monotonic() - job.wall
+        # Reap anything the child left behind in its process group.
+        try:
+            os.killpg(job.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        del active[job.pid]
+        if cleanup:
+            cleanup(job)
+
+    while pending or active:
+        while pending and len(active) < parallel:
+            start(pending.pop(0))
+        timeout = max(0.05, min(j.deadline for j in active.values()) - time.monotonic())
+        for key, _ in sel.select(timeout):
+            job = key.data
+            try:
+                data = os.read(job.fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                data = b""
+            if data:
+                _consume(job, data)
+            else:
+                finish(job)
+        now = time.monotonic()
+        for job in list(active.values()):
+            if now > job.deadline:
+                log(f"  job {job.key} over budget, killed")
+                finish(job, kill=True)
+    sel.close()
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Build-time calibration: which tests pass under this runner on the base commit.
+
+
+def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
+    warm_imports(["duckdb", "pandas", "numpy"])
+    by_file = {}
+    for t in tests_list:
+        by_file.setdefault(t.split("::", 1)[0], []).append(t)
+    groups = [[] for _ in range(chunks)]
+    loads = [0] * chunks
+    for f, ts in sorted(by_file.items(), key=lambda kv: -len(kv[1])):
+        i = loads.index(min(loads))
+        groups[i].extend(ts)
+        loads[i] += len(ts)
+    jobs = [
+        Job(i, {"root": repo, "nodeids": g, "default_timeout": 600.0}, budget=900.0)
+        for i, g in enumerate(groups)
+        if g
+    ]
+    t0 = time.monotonic()
+    run_jobs(jobs, parallel=parallel)
+    passed = set()
+    for job in jobs:
+        passed |= job.passed
+        if job.collect_failed or job.crashed or not job.done:
+            log(f"  calibration job {job.key}: done={job.done} crash={job.crashed} collect={sorted(job.collect_failed)[:3]}")
+    failed = sorted(set(tests_list) - passed)
+    log(f"calibration: {len(passed)} pass, {len(failed)} not verifiable, {time.monotonic() - t0:.1f}s")
+    for t in failed[:30]:
+        log(f"  not verifiable: {t}")
+    with open(out_path, "w") as fh:
+        json.dump({"passed": sorted(passed)}, fh)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "--calibrate":
+        import pickle
+
+        with open(sys.argv[3], "rb") as fh:
+            maps = pickle.load(fh)
+        calibrate(sys.argv[2], maps["tests"], sys.argv[4], parallel=int(sys.argv[5]) if len(sys.argv) > 5 else 4)
