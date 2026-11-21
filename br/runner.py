@@ -449,17 +449,23 @@ def child_main(spec, wfd):
 # Parent side.
 
 
-def warm_imports(extra_modules=()):
-    """Imports pytest and its built-in plugins once, before any fork."""
+def warm_imports(extra_modules=(), with_pytest=False):
+    """Imports, once before any fork, what the children need: unittest (sqlglot reads
+    `"unittest" in sys.modules` at import time, so it must come first) and the
+    third-party modules of the test files about to run.  pytest and its plugins
+    (0.3 s of CPU) only for the pytest mode: the unittest runner never needs them."""
     os.environ.setdefault("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
-    import pytest  # noqa: F401
-    from _pytest.config import default_plugins
+    import unittest  # noqa: F401
 
-    for name in default_plugins:
-        try:
-            importlib.import_module(f"_pytest.{name}")
-        except Exception:
-            pass
+    if with_pytest or os.environ.get("BR_WARM_PYTEST") == "1":
+        import pytest  # noqa: F401
+        from _pytest.config import default_plugins
+
+        for name in default_plugins:
+            try:
+                importlib.import_module(f"_pytest.{name}")
+            except Exception:
+                pass
     for mod in extra_modules:
         try:
             importlib.import_module(mod)
