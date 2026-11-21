@@ -65,6 +65,9 @@ def pytest_runtest_setup(item):
     if _ACTIVE:
         _phase(item, "setup")
     yield
+    if _ACTIVE and brcore.TRACK_KEYS:
+        # Data that setUpClass/setUp stored on the class: track which tests read it.
+        brcore.track_test_class(getattr(item, "cls", None))
 
 
 @pytest.hookimpl(hookwrapper=True)

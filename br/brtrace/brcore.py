@@ -463,6 +463,102 @@ class TrackDict(dict):
         return dict.__sizeof__(self)
 
 
+class TrackList(list):
+    """A test-class data attribute (e.g. fixture rows loaded by setUpClass): any read
+    records (label, ALL) for the running test."""
+
+    __slots__ = ("_br_label",)
+
+    def _r(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+
+    def __iter__(self):
+        self._r()
+        return list.__iter__(self)
+
+    def __reversed__(self):
+        self._r()
+        return list.__reversed__(self)
+
+    def __getitem__(self, i):
+        self._r()
+        return list.__getitem__(self, i)
+
+    def __len__(self):
+        self._r()
+        return list.__len__(self)
+
+    def __contains__(self, x):
+        self._r()
+        return list.__contains__(self, x)
+
+    def __eq__(self, other):
+        self._r()
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        self._r()
+        return list.__ne__(self, other)
+
+    __hash__ = None
+
+    def __repr__(self):
+        self._r()
+        return list.__repr__(self)
+
+    def __add__(self, other):
+        self._r()
+        return list.__add__(self, other)
+
+    def __mul__(self, n):
+        self._r()
+        return list.__mul__(self, n)
+
+    def copy(self):
+        self._r()
+        return list(list.__iter__(self))
+
+    def index(self, *a):
+        self._r()
+        return list.index(self, *a)
+
+    def count(self, x):
+        self._r()
+        return list.count(self, x)
+
+    def __reduce_ex__(self, protocol):
+        self._r()
+        return (list, (list(list.__iter__(self)),))
+
+
+def track_test_class(cls):
+    """Wraps the list and dict attributes of a test class (after its setup ran), so
+    the tests that actually use data loaded by setUpClass/setUp are known."""
+    if cls is None or getattr(cls, "_br_tracked", False):
+        return
+    try:
+        cls._br_tracked = True
+    except Exception:
+        return
+    for name, val in list(vars(cls).items()):
+        if name.startswith("__") or name == "_br_tracked":
+            continue
+        label = f"{cls.__module__}:{cls.__qualname__}.{name}"
+        try:
+            if type(val) is list:
+                tv = TrackList(val)
+            elif type(val) is dict:
+                tv = TrackDict(val)
+            else:
+                continue
+            tv._br_label = label
+            setattr(cls, name, tv)
+            TRACKED_NEW[label] = label
+        except Exception:
+            TRACKED_NEW[label] = None
+
+
 def _module_classes(module, name):
     out, stack = [], [v for v in vars(module).values() if isinstance(v, type) and v.__module__ == name]
     seen = set()

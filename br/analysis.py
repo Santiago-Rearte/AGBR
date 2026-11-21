@@ -19,6 +19,7 @@ STMTLIKE = (ast.stmt, ast.excepthandler, ast.match_case)
 BLOCK_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
 PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"}
 KEY_REFINE = os.environ.get("BR_KEY_REFINE", "1") == "1"
+SETUP_REFINE = os.environ.get("BR_SETUP_REFINE", "1") == "1"
 KEYS_PATH = os.path.join(os.environ.get("BR_MAPS", "/opt/maps"), "keys.pkl")
 
 
@@ -285,6 +286,18 @@ class Analyzer:
             # rewriting), which would make each test a "reader" of its own file.  Its
             # own tests are covered by line coverage of the changed statement instead.
             bits &= ~self.m["by_file"].get(rel, 0)
+        groups = (self.m.get("group_reads") or {}).get(rel)
+        if groups and SETUP_REFINE and not rel.endswith(".py") and "own_reads" in self.m:
+            # Read by shared setup (class setup, module collection): only the tests
+            # that use what the setup loaded from it.
+            refined = self.m["own_reads"].get(rel, 0)
+            for g in groups:
+                kind, _, key = g.partition(":")
+                users = self.setup_data_users(key, rel) if kind == "class" else None
+                if users is None:
+                    users = self.m["by_class" if kind == "class" else "by_file"].get(key, 0)
+                refined |= users
+            bits &= refined
         return bits
 
     def dirs(self, rel_dir):
@@ -863,6 +876,123 @@ class Analyzer:
         }
         return bits, info
 
+
+    # -- data read by shared test setup ------------------------------------------
+
+    def setup_data_users(self, class_key, rel):
+        """Tests of a test class that use the data its setup methods loaded from rel.
+
+        Data flow inside the class's setup/teardown methods: a statement naming the
+        file (a string constant rel ends with) taints what it assigns (or the objects
+        it calls methods on); a statement reading a tainted name or class attribute
+        taints its own targets.  The users are the tests that read a tainted class
+        attribute at build time (brcore.track_test_class).  None when unsure: no
+        statement names the file, or a tainted class attribute was not tracked."""
+        f, _, qual = class_key.partition("::")
+        try:
+            tree = self.tree(f)
+        except Exception:
+            return None
+        body, cls = tree.body, None
+        for part in qual.split("::"):
+            cls = next((s for s in body if isinstance(s, ast.ClassDef) and s.name == part), None)
+            if cls is None:
+                return None
+            body = cls.body
+        methods = [s for s in cls.body if isinstance(s, DEFS) and s.name.lower().startswith(("setup", "teardown"))]
+        stmts = []
+        for m in methods:
+            for n in ast.walk(m):
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.For, ast.With, ast.Return)):
+                    stmts.append(n)
+
+        def syms(node):
+            out = set()
+            if node is None:
+                return out
+            for x in ast.walk(node):
+                if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id in ("cls", "self"):
+                    out.add(("attr", x.attr))
+                elif isinstance(x, ast.Name) and x.id not in ("cls", "self"):
+                    out.add(("name", x.id))
+            return out
+
+        def base_syms(t):
+            # The symbol a target writes into: x, cls.x, x[...], cls.x[...], x.y = ...
+            while isinstance(t, (ast.Subscript, ast.Starred)) or (
+                isinstance(t, ast.Attribute) and not (isinstance(t.value, ast.Name) and t.value.id in ("cls", "self"))
+            ):
+                t = t.value
+            if isinstance(t, (ast.Tuple, ast.List)):
+                return set().union(*(base_syms(e) for e in t.elts)) if t.elts else set()
+            return syms(t) if isinstance(t, (ast.Name, ast.Attribute)) else set()
+
+        def flow(s):
+            """(targets, sources) of a statement."""
+            if isinstance(s, ast.Assign):
+                return set().union(*(base_syms(t) for t in s.targets)), syms(s.value)
+            if isinstance(s, ast.AnnAssign):
+                return base_syms(s.target), syms(s.value)
+            if isinstance(s, ast.AugAssign):
+                return base_syms(s.target), syms(s.value) | base_syms(s.target)
+            if isinstance(s, ast.For):
+                return base_syms(s.target), syms(s.iter)
+            if isinstance(s, ast.With):
+                tg = set()
+                for it in s.items:
+                    tg |= base_syms(it.optional_vars) if it.optional_vars is not None else set()
+                return tg, set().union(*(syms(it.context_expr) for it in s.items))
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
+                # obj.method(args): the receiver may store what the arguments carry.
+                func = s.value.func
+                tg = base_syms(func.value) if isinstance(func, ast.Attribute) else set()
+                src = set().union(*(syms(a) for a in s.value.args), *(syms(k.value) for k in s.value.keywords))
+                return tg, src
+            return set(), syms(s)
+
+        def names_file(node):
+            for x in ast.walk(node):
+                if isinstance(x, ast.Constant) and isinstance(x.value, str) and len(x.value) >= 6:
+                    v = x.value.lstrip("./")
+                    if ("/" in v or "." in v) and rel.endswith(v):
+                        return True
+            return False
+
+        tainted = set()
+        for s in stmts:
+            if names_file(s):
+                tg, _src = flow(s)
+                if not tg:
+                    return None  # the file feeds something we cannot follow
+                tainted |= tg
+        if not tainted:
+            return None
+        changed = True
+        while changed:
+            changed = False
+            for s in stmts:
+                tg, src = flow(s)
+                if src & tainted and not tg:
+                    if isinstance(s, (ast.Expr, ast.Return)):
+                        return None  # handed to a call or returned: not followed
+                if src & tainted and not tg <= tainted:
+                    tainted |= tg
+                    changed = True
+        attrs = sorted(a for kind, a in tainted if kind == "attr")
+        if not attrs:
+            return None
+        kd = self.keydata()
+        tracked, reads, sets = kd.get("tracked") or {}, kd.get("reads") or {}, kd.get("sets") or []
+        mod = modname(f) or ""
+        cqual = qual.replace("::", ".")
+        bits = 0
+        for a in attrs:
+            label = f"{mod}:{cqual}.{a}"
+            if not tracked.get(label):
+                return None
+            for sid in (reads.get(label) or {}).values():
+                bits |= sets[sid]
+        return bits
 
     def func_lines_bits(self, rel, node):
         """Tests that ran any function or lambda defined inside node.

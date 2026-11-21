@@ -114,6 +114,21 @@ def main(raw_dir, out_dir):
         for k in range(6):
             dest[k] |= rec[k]
 
+    # File reads made in a test's own phases vs in shared setup (class setup/teardown,
+    # module collection): the latter are refined at run time through the class data
+    # attributes that setup filled (see analysis.reads).
+    own_reads = defaultdict(int)
+    for name, rec in contexts.items():
+        if "|" in name and not name.startswith("collect|"):
+            nodeid, phase = name.rsplit("|", 1)
+            if nodeid in index and phase not in ("setup", "teardown"):
+                for r in rec[1]:
+                    own_reads[r.replace(os.sep, "/")] |= 1 << index[nodeid]
+    group_reads = defaultdict(set)
+    for (kind, key), rec in group_ctx.items():
+        for r in rec[1]:
+            group_reads[r.replace(os.sep, "/")].add(f"{kind}:{key}")
+
     for (kind, key), rec in group_ctx.items():
         members = [t for t in tests if (tfile(t) if kind == "file" else tclass(t)) == key]
         for t in members:
@@ -168,6 +183,8 @@ def main(raw_dir, out_dir):
         "by_file": dict(by_file),
         "by_class": dict(by_class),
         "outcomes": outcomes,
+        "own_reads": dict(own_reads),
+        "group_reads": {k: sorted(v) for k, v in group_reads.items()},
         "family": class_families(),
     }
     maps["near"] = coverage_neighbours(tests, index, per_test, files, durations)
