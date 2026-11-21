@@ -37,6 +37,11 @@ CALIB = {}
 HEAVY_SEC = float(os.environ.get("BR_HEAVY_SEC", "1.5"))
 MIN_CHEAP_COVER = int(os.environ.get("BR_MIN_CHEAP_COVER", "3"))
 DOMINANCE = os.environ.get("BR_DOMINANCE", "1") == "1"
+DOMINANCE_IMPORT = os.environ.get("BR_DOMINANCE_IMPORT", "0") == "1"
+MIN_CHEAP_IMPORT = int(os.environ.get("BR_MIN_CHEAP_IMPORT", "10"))
+PROBES = os.environ.get("BR_PROBES", "0") == "1"
+PROBES_PER_HEAVY = int(os.environ.get("BR_PROBES_PER_HEAVY", "6"))
+MIN_PROBES = int(os.environ.get("BR_MIN_PROBES", "3"))
 
 
 def log(*args):
@@ -85,6 +90,7 @@ class Plan:
         self.dominated = set()
         self.conditional = set()
         self.stop_on_fail = False
+        self.check_imports = False
 
 
 def main():
@@ -156,6 +162,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
     file_of = {t["number"]: t["file"] for t in tests}
 
     an = analysis.Analyzer(maps, REPO)
+    num2idx = {n: i for i, n in enumerate(idx2num) if n >= 0}
     idx_sec = [sec.get(n, 0.0) if n >= 0 else 0.0 for n in idx2num]
     cheap_all = 0
     for i, n in enumerate(idx2num):
@@ -188,6 +195,13 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             data_change = any(not fp.path.endswith(".py") for fp in fps)
             plan.fail_prior = DATA_FAIL_PRIOR if data_change else FAIL_PRIOR
             decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of)
+            if PROBES and VERIFY and not static and an.trace.get("import") and not an.trace.get("nonsite"):
+                add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec)
+            # Changed code that runs at import time can break the import of every
+            # user; such patches always get an import check, even when nothing is run.
+            if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
+                plan.check_imports = True
+                plan.modules = sorted(set(plan.modules) | {m for m in an.trace.get("import_mods", ()) if m.startswith("sqlglot")})
         except Exception:
             log(f"{c}: analysis crashed, selecting everything\n{traceback.format_exc()}")
             plan.static = set(all_nums)
@@ -197,7 +211,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             f" ({time.monotonic() - t0:.2f}s) {' '.join(plan.notes)[:200]}"
         )
 
-    jobs = [p for p in plans if p.run]
+    jobs = [p for p in plans if p.run or (p.check_imports and p.modules)]
     if jobs and VERIFY:
         verify(jobs, runner, an, idx2num, id2num, num2id, sec)
 
@@ -218,6 +232,8 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                 nums |= p.conditional
         elif p.conditional:
             nums |= p.conditional
+        if p.job is not None and not p.run and not p.job.done:
+            nums |= set(all_nums)  # the import check itself did not finish
         results[p.commit] = sorted(n for n in nums if n in dur_ms)
         cost, workers = pack(results[p.commit], dur_ms)
         log(f"{p.commit}: selected={len(results[p.commit])} cost={cost / 1000:.3f}s workers={len(workers)}")
@@ -232,7 +248,7 @@ def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
     the changed statement and every line of the enclosing function the heavy test
     runs is also run by some cheap test (no path only the heavy test exercises)."""
     trace = an.trace
-    if trace["other"] or not trace["runtime"]:
+    if trace.get("nonsite") or not (trace["runtime"] or trace.get("import")):
         return 0
     heavy = 0
     for i in __import__("analysis").iter_bits(cand_bits):
@@ -240,6 +256,12 @@ def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
             heavy |= 1 << i
     if not heavy:
         return 0
+    if trace.get("import"):
+        # Class- or module-level change: no enclosing function to compare paths in.
+        # Measured-risk rule: enough cheap tests use the changed code for one of them
+        # to fail whenever a heavy one does.
+        if not DOMINANCE_IMPORT or bin(cand_bits & cheap_all).count("1") < MIN_CHEAP_IMPORT:
+            return 0
     skippable = heavy
     for rel, units, (flo, fhi) in trace["runtime"]:
         covering = an.units_bits(rel, units) & cheap_all & cand_bits
@@ -254,6 +276,38 @@ def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
             if not (b & cheap_all):
                 skippable &= ~b
     return skippable
+
+
+def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
+    """Measured-risk rule for class- and module-level changes.
+
+    Each heavy candidate is selected only if one of its closest cheap coverage
+    neighbours (also candidates) fails.  The neighbours are run as probes (stop at
+    the first failure); every other cheap candidate keeps its usual treatment."""
+    near = maps.get("near") or {}
+    heavy = [n for n in plan.static if n in cands and sec[n] >= HEAVY_SEC and n not in plan.conditional]
+    if not heavy:
+        return
+    probes, gated = set(), set()
+    for h in heavy:
+        picks = []
+        for i in near.get(num2idx.get(h, -1), ()):
+            n = idx2num[i]
+            if n >= 0 and n in cands and n != h and sec[n] < HEAVY_SEC and maps["tests"][i] in verifiable:
+                picks.append(n)
+                if len(picks) >= PROBES_PER_HEAVY:
+                    break
+        if len(picks) >= MIN_PROBES:
+            probes.update(picks)
+            gated.add(h)
+    if not gated:
+        return
+    plan.conditional |= gated
+    plan.static -= gated | probes
+    if not plan.run:
+        plan.stop_on_fail = True
+    plan.run |= probes
+    plan.notes.append(f"probes({len(gated)}:{len(probes)})")
 
 
 def prepare_overlay(plan, fps, an, patchlib):

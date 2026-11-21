@@ -23,11 +23,14 @@ import runner  # noqa: E402
 import selector  # noqa: E402
 
 REPO = "/opt/sqlglot"
+MODE = "runtime"
 
 
 def main():
     n, seed, tests_json = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
     out_path = sys.argv[4] if len(sys.argv) > 4 else None
+    global MODE
+    MODE = sys.argv[5] if len(sys.argv) > 5 else "runtime"
     rng = random.Random(seed)
     maps = pickle.load(open("/opt/maps/maps.pkl", "rb"))
     calib = json.load(open("/opt/maps/verifiable.json"))
@@ -51,6 +54,7 @@ def main():
             if maps["sets"][sid] & heavy_all:
                 heavy_lines.append((rel, ln))
     print(f"{len(heavy_lines)} lines executed by heavy tests", flush=True)
+    all_files = sorted({rel for rel, _ in heavy_lines})
     an = analysis.Analyzer(maps, REPO)
     runner.warm_imports(["duckdb", "pandas", "numpy"])
     os.environ.setdefault("PYTHON_CPU_COUNT", "2")
@@ -58,7 +62,11 @@ def main():
     tries = 0
     while stats["mutants"] < n and tries < n * 200:
         tries += 1
-        rel, ln = rng.choice(heavy_lines)
+        if MODE == "import":
+            rel = rng.choice(all_files)
+            ln = rng.randrange(1, len(open(os.path.join(REPO, rel), encoding="utf-8").read().split(chr(10))) + 1)
+        else:
+            rel, ln = rng.choice(heavy_lines)
         sub = random.Random(rng.random())
         # Reuse the generic mutator but pinned to this file/line.
         lines = open(os.path.join(REPO, rel), encoding="utf-8").read().split("\n")
@@ -67,8 +75,10 @@ def main():
             continue
         label, patch, new_text = m
         bits, notes, static = an.analyze(patchlib.parse(patch))
-        if an.trace["other"] or not an.trace["runtime"]:
-            continue  # the rule only applies to statements inside functions
+        if MODE == "runtime" and (an.trace["other"] or not an.trace["runtime"]):
+            continue  # only statements inside functions
+        if MODE == "import" and (not an.trace.get("import") or an.trace.get("nonsite")):
+            continue  # only class- or module-level changes
         stats["mutants"] += 1
         dom = selector.dominated_heavy(an, bits, idx_sec, cheap_all) if not static else 0
         rec = {"file": rel, "line": ln, "label": label, "dom": [T[i].split("::")[-1] for i in analysis.iter_bits(dom)]}

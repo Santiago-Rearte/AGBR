@@ -158,6 +158,7 @@ def main(raw_dir, out_dir):
         "outcomes": outcomes,
         "family": class_families(),
     }
+    maps["near"] = coverage_neighbours(tests, index, per_test, files, durations)
     maps["import_lines"] = import_lines(os.path.join(raw_dir, "import.trace"), repo)
     maps["mod_files"] = module_files(repo)
     mod_classes = defaultdict(list)
@@ -175,6 +176,40 @@ def main(raw_dir, out_dir):
     )
     for t, o in sorted(bad.items())[:20]:
         print(f"  base {o}: {t}", file=sys.stderr)
+
+
+def coverage_neighbours(tests, index, per_test, files, durations, slow=0.8, keep=60):
+    """For every slow test, the fast tests that run most of the same sqlglot lines.
+
+    Used at run time as probes: a change that breaks a slow test is expected to
+    break some of its closest fast neighbours as well."""
+    sqlglot_files = {i for i, f in enumerate(files) if f.startswith("sqlglot/")}
+
+    def lines_of(t):
+        rec = per_test.get(t)
+        if rec is None:
+            return set()
+        return {k for k in rec[0] if k // 1_000_000 in sqlglot_files}
+
+    slow_tests = [t for t in tests if durations.get(t, 0.0) >= slow]
+    fast_tests = [t for t in tests if durations.get(t, 0.0) < slow]
+    fast_lines = {t: lines_of(t) for t in fast_tests}
+    near = {}
+    for h in slow_tests:
+        hl = lines_of(h)
+        if not hl:
+            continue
+        scored = []
+        for c, cl in fast_lines.items():
+            if not cl:
+                continue
+            inter = len(hl & cl)
+            if inter:
+                scored.append((-inter, durations.get(c, 0.0), c))
+        scored.sort()
+        near[index[h]] = [index[c] for _, _, c in scored[:keep]]
+    print(f"  neighbours for {len(near)} slow tests", file=sys.stderr)
+    return near
 
 
 def class_families():

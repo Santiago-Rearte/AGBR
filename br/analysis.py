@@ -216,7 +216,7 @@ class Analyzer:
         self.import_lines = maps.get("import_lines", {})
         self.mod_classes = maps.get("mod_classes", {})
         self.eager = set(maps.get("eager", ()))
-        self.trace = {"runtime": [], "other": False}
+        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set()}
 
     def release(self):
         """Forgets cached ASTs and sources (they are rebuilt on demand)."""
@@ -363,6 +363,9 @@ class Analyzer:
                 ms = il.get(ln)
                 if ms:
                     mods.update(ms)
+        # These modules run the changed code while being imported: the run-time
+        # import check must import them, since an exception there breaks every user.
+        self.trace.setdefault("import_mods", set()).update(mods)
         bits = 0
         for mod in mods:
             mrel = self.m["mod_files"].get(mod)
@@ -419,6 +422,7 @@ class Analyzer:
 
         if depth == 0:
             self.trace["other"] = True
+            self.trace["import"] = True
         # Import-time site: module or class body, or a def/class header.
         classes = []
         hdr = None
@@ -484,9 +488,10 @@ class Analyzer:
             names = bound_names(stmt)
             bits |= self.func_lines_bits(rel, stmt)
             if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and names:
-                readers = self.attr_readers(names, rel, stmt)
-                if readers is not None:
-                    users &= readers
+                bounded = self.attr_readers(names, rel, stmt)
+                if bounded is not None:
+                    readers, copiers = bounded
+                    users = (users | copiers) & readers
         elif isinstance(stmt, tuple):
             _, owner, pos = stmt
             for s in owner.body[max(0, pos - 1) : pos + 1]:
@@ -529,6 +534,16 @@ class Analyzer:
                     continue
                 if f == rel and [c.name for c in classes] == [c.name for c in chain]:
                     continue  # the class's own body
+                # Only aliases (`Parser = SnowflakeParser`, `tokenizer_class = Tokenizer`)
+                # make the holder hand the class itself out.  Mentions inside dicts or
+                # calls dispatch on instances, which the class family already covers.
+                stmt = next((n for n, fl, _i in path if fl == "__ref__"), None)
+                if not (
+                    isinstance(stmt, (ast.Assign, ast.AnnAssign))
+                    and isinstance(stmt.value, (ast.Name, ast.Attribute))
+                    and (stmt.value.id if isinstance(stmt.value, ast.Name) else stmt.value.attr) == name
+                ):
+                    continue
                 holders.add((f, ".".join(c.name for c in classes)))
         for f, qual in holders:
             hkey = f"{modname(f)}:{qual}"
@@ -550,14 +565,20 @@ class Analyzer:
         return bits
 
     def attr_readers(self, names, origin_rel, stmt):
-        """Tests that execute run-time code mentioning one of names, or None when some
-        mention is evaluated at import time (the value may be copied into derived state)."""
+        """(readers, copiers) for a class attribute, or None when it cannot be bounded.
+
+        readers: tests that execute code mentioning one of names (plus, when that code
+        also runs while some module is imported, every test depending on that module).
+        copiers: users of other classes whose body copies the attribute under the same
+        name (`X = {**Base.X, ...}`); run-time reads of the name cover those copies.
+        None when a mention feeds import-time state under another name."""
         key = ("readers", tuple(sorted(names)), origin_rel, _lineno(stmt))
         if key in self._memo:
             return self._memo[key]
         pat = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
         lo0, hi0 = span(stmt)
         readers = 0
+        copiers = 0
         hits = 0
         result = None
         for rel, text in self.corpus().items():
@@ -567,7 +588,6 @@ class Analyzer:
             hits += len(lines_hit)
             if hits > 3000:
                 break
-            il = self.import_lines.get(rel, {})
             seen_stmts = set()
             ok = True
             for ln in lines_hit:
@@ -583,37 +603,33 @@ class Analyzer:
                     continue
                 seen_stmts.add(id(lam or node))
                 in_func = any(isinstance(n, FUNC) and f == "body" for n, f, _i in path)
-                if lam is not None:
-                    hs = span(lam)
-                    if any(l in il for l in range(hs[0], hs[1] + 1)):
-                        ok = False
-                        break
-                    readers |= self.lines_bits(rel, hs[0], hs[1])
+                if lam is not None or in_func:
+                    hs = span(lam) if lam is not None else (header_span(node) or span(node))
+                    readers |= self.units_bits(rel, [hs])
                     continue
-                if not in_func:
-                    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and not isinstance(
-                        node, ast.AugAssign
-                    ):
-                        value = node.value
-                        mentioned = value is not None and any(
-                            (isinstance(x, ast.Name) and x.id in names)
-                            or (isinstance(x, ast.Attribute) and x.attr in names)
-                            or (isinstance(x, ast.Constant) and x.value in names)
-                            for x in ast.walk(value)
-                        )
-                        if not mentioned:
-                            continue  # another class defining the same attribute
-                    ok = False
-                    break
-                hs = header_span(node) or span(node)
-                if any(l in il for l in range(hs[0], hs[1] + 1)):
-                    ok = False
-                    break
-                readers |= self.lines_bits(rel, hs[0], hs[1])
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    value = node.value
+                    mentioned = value is not None and any(
+                        (isinstance(x, ast.Name) and x.id in names)
+                        or (isinstance(x, ast.Attribute) and x.attr in names)
+                        or (isinstance(x, ast.Constant) and x.value in names)
+                        for x in ast.walk(value)
+                    )
+                    if not mentioned:
+                        continue  # another class defining the same attribute
+                    classes = [n for n, f, _i in path if isinstance(n, ast.ClassDef) and f == "body"]
+                    if classes and bound_names(node) <= set(names):
+                        # A subclass copying the attribute under the same name.
+                        qual = ".".join(c.name for c in classes)
+                        copiers |= self.family_bits(f"{modname(rel)}:{qual}")
+                        copiers |= self.func_lines_bits(rel, classes[-1])
+                        continue
+                ok = False
+                break
             if not ok:
                 break
         else:
-            result = readers
+            result = (readers, copiers)
         self._memo[key] = result
         return result
 
@@ -757,7 +773,7 @@ class Analyzer:
 
         self.trace then says whether every change was a statement inside a function
         ("runtime" sites with their line units and enclosing function span)."""
-        self.trace = {"runtime": [], "other": False}
+        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set()}
         bits = 0
         notes = []
         static = False
@@ -772,6 +788,7 @@ class Analyzer:
             notes.append(f"{fp.path}:{note}")
             if not (note.startswith("sites=") or note in ("noop", "mode")):
                 self.trace["other"] = True
+                self.trace["nonsite"] = True
         return bits, notes, static
 
     def analyze_file(self, fp):

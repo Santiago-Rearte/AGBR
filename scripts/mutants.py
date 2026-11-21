@@ -78,7 +78,7 @@ def mutate_line(rng, rel, lines, i):
     except SyntaxError:
         return None
     diff = difflib.unified_diff(
-        old_text.split("\n"), new_text.split("\n"), f"a/{rel}", f"b/{rel}", lineterm="", n=3
+        old_text.splitlines(), new_text.splitlines(), f"a/{rel}", f"b/{rel}", lineterm="", n=3
     )
     patch = f"diff --git a/{rel} b/{rel}\n" + "\n".join(diff) + "\n"
     return label, patch.encode(), new_text.encode()
