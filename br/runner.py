@@ -213,7 +213,7 @@ def _slice_lists(cls, ckey, attrs, out):
 
 
 def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, keep=(), slices=None,
-                 record_lists=False):
+                 record_lists=False, cont=(), phase2=()):
     """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
     collection cost.  Class and module fixtures are handled by unittest.TestSuite."""
     import unittest
@@ -292,7 +292,7 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
             elif self.stop_on_fail:
                 out.write("STOPPED\n")
                 out.flush()
-                if not keep:
+                if not keep and not cont and not phase2:
                     os._exit(0)
                 # Some tests must still run (the neighbours deciding whether gated
                 # heavy tests are needed): stop this pass, run them next.
@@ -341,8 +341,9 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
         import gc
 
         gc.freeze()
+    phase2 = set(phase2)
     first = Result()
-    unittest.TestSuite(tests).run(first)
+    unittest.TestSuite([t for t in tests if by_id.get(t.id()) not in phase2]).run(first)
     # (When nothing passed before the first failure the change breaks everything it
     # touches: the gated heavy tests are selected anyway, so skip the second pass.)
     if first.shouldStop and keep and (first.ok - first.bad):
@@ -373,6 +374,16 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
             second.stop_on_fail = False
             second.ran = first.ran
             unittest.TestSuite(rest).run(second)
+    # cont / phase2: once the change is known to be live (a failure), the tests that
+    # would otherwise be selected unverified still run, so only real failures are.
+    more = set(cont) | phase2
+    if more and (first.bad or first.shouldStop) and (first.ok - first.bad):
+        rest = [t for t in tests if by_id.get(t.id()) in more and by_id.get(t.id()) not in first.ran]
+        if rest:
+            third = Result()
+            third.stop_on_fail = False
+            third.ran = first.ran
+            unittest.TestSuite(rest).run(third)
 
 
 def check_lazy_attributes(out, base_all, only):
@@ -541,6 +552,8 @@ def child_main(spec, wfd):
                 [list(g) for g in (spec.get("keep") or ())],
                 spec.get("slices") or None,
                 bool(spec.get("record_lists")),
+                spec.get("cont") or (),
+                spec.get("phase2") or (),
             )
             out.write("DONE\n")
             out.flush()

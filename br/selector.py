@@ -52,6 +52,10 @@ PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
 # by default the cheap remainder is verified rather than dropped.
 PROBE_VERIFY = os.environ.get("BR_PROBE_VERIFY", "1") == "1"
 PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU seconds (calibrated)
+LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
+CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
+KEEP_RATIO = float(os.environ.get("BR_KEEP_RATIO", "2.0"))  # neighbours run when cheaper than this x heavy
+LIVE_REST_MAX = float(os.environ.get("BR_LIVE_REST_MAX", "15.0"))  # CPU seconds (calibrated)
 # Probe gating of heavy tests also for changes inside functions.
 PROBES_RUNTIME = os.environ.get("BR_PROBES_RUNTIME", "0") == "1"
 PROBE_DROP_RUNTIME = os.environ.get("BR_PROBE_DROP_RUNTIME", "0") == "1"
@@ -127,6 +131,8 @@ class Plan:
         self.keyref = []  # key-level refinements, each with its unrefined fallback
         self.sliced = {}  # heavy test -> (class key, {attr: base item fingerprints})
         self.mixed = False  # data and code changes together
+        self.cont = set()  # run tests still run after the first failure stops the pass
+        self.phase2 = set()  # conditional tests verified only once the change is live
 
 
 def main():
@@ -331,6 +337,8 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                 ok = PER_HEAVY and job is not None and job.done and not job.crashed
                 ok = ok and not job.collect_failed and not job.import_failed
                 for h in p.conditional:
+                    if h in p.phase2 and ok and num2id[h] in passed:
+                        continue  # verified in the second pass
                     nb = p.cond_near.get(h) if ok else None
                     if not nb or not is_strict(h) or any(num2id[x] not in passed for x in nb):
                         nums.add(h)
@@ -489,19 +497,26 @@ def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None, limit=N
         probes |= set(ranked[:FOCUS_PROBES])
     if not probes:
         return
-    if PROBE_VERIFY or plan.mixed:
-        # Exact variant (always for data + code patches): the cheap verifiable remainder is run too (stopping at the
-        # first failure) instead of being dropped when the probes pass, unless that
-        # costs more CPU than PROBE_VERIFY_MAX; heavy or unverifiable tests stay
-        # conditional either way.
-        tc, sc, cc = CALIB.get("test_cpu", {}), CALIB.get("setup_cpu", {}), CALIB.get("collect_cpu", {})
-        ids = [num2id[n] for n in pool]
-        est = sum(tc.get(i, CPU_FACTOR * sec[n]) for i, n in zip(ids, pool))
-        est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
-        est += sum(cc.get(f, FILE_OVERHEAD) for f in {i.split("::", 1)[0] for i in ids})
-        if est <= PROBE_VERIFY_MAX:
-            probes |= set(pool)
-        plan.notes.append(f"{'verify' if est <= PROBE_VERIFY_MAX else 'drop'}-rest({len(pool)}:{est:.1f}s)")
+    tc, sc, cc = CALIB.get("test_cpu", {}), CALIB.get("setup_cpu", {}), CALIB.get("collect_cpu", {})
+    ids = [num2id[n] for n in pool]
+    est = sum(tc.get(i, CPU_FACTOR * sec[n]) for i, n in zip(ids, pool))
+    est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
+    est += sum(cc.get(f, FILE_OVERHEAD) for f in {i.split("::", 1)[0] for i in ids})
+    mode = "drop"
+    if (PROBE_VERIFY or plan.mixed) and est <= PROBE_VERIFY_MAX:
+        # Exact variant (always for data + code patches): the cheap verifiable
+        # remainder is run too instead of being dropped when the probes pass; after a
+        # first failure it is still run (not selected unverified).
+        if CONT_REST:
+            plan.cont |= set(pool) - probes
+        probes |= set(pool)
+        mode = "verify"
+    elif LIVE_REST and est <= LIVE_REST_MAX:
+        # Probe-drop as usual, but once the run finds the change live the cheap
+        # remainder is verified (second pass) instead of all being selected.
+        plan.phase2 |= set(pool) - probes
+        mode = "live"
+    plan.notes.append(f"{mode}-rest({len(pool)}:{est:.1f}s)")
     rest = plan.static - probes
     plan.conditional |= rest
     plan.static -= rest | probes
@@ -814,26 +829,30 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
                 ids = [num2id[x] for x in nb]
                 est = sum(tc.get(i, sec[id2num[i]]) for i in ids)
                 est += sum(sc.get(c, 0.0) for c in {i.rsplit("::", 1)[0] for i in ids})
-                if est * CPU_FACTOR < 0.5 * sec[h]:
+                if est * CPU_FACTOR < KEEP_RATIO * sec[h]:
                     keep.append(sorted(ids))
         if p.sliced:
             spec_slices = {}
             for _n, (key, attrs) in sorted(p.sliced.items()):
                 spec_slices.setdefault(key, {}).update(attrs)
         tcpu = CALIB.get("test_cpu", {})
+        phase2 = sorted(num2id[n] for n in p.phase2 & p.conditional)
         timeouts = {
-            num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
+            num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0)
+            for n in p.run | (p.phase2 & p.conditional)
         }
         budget = 20.0 + sum(timeouts.values()) + (25.0 if p.modules else 0.0)
         spec = {
             "root": root,
-            "nodeids": nodeids,
+            "nodeids": nodeids + phase2,
             "timeouts": timeouts,
             "import_check": p.modules,
             "lazy_all": LAZY_ALL,
             # Once a cheap test fails the dominated heavy tests are selected anyway.
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
             "keep": keep,
+            "cont": sorted(num2id[n] for n in p.cont & p.run),
+            "phase2": phase2,
         }
         if p.sliced:
             spec["slices"] = spec_slices
