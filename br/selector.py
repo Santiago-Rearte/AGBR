@@ -54,6 +54,8 @@ PROBE_VERIFY = os.environ.get("BR_PROBE_VERIFY", "1") == "1"
 PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU seconds (calibrated)
 LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
+RT_DROP_RUN = os.environ.get("BR_RT_DROP_RUN", "0") == "1"
+RT_DROP_MIN_RUN = int(os.environ.get("BR_RT_DROP_MIN_RUN", "20"))
 KEEP_RATIO = float(os.environ.get("BR_KEEP_RATIO", "2.0"))  # neighbours run when cheaper than this x heavy
 LIVE_REST_MAX = float(os.environ.get("BR_LIVE_REST_MAX", "15.0"))  # CPU seconds (calibrated)
 # Probe gating of heavy tests also for changes inside functions.
@@ -286,6 +288,14 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                     focus = focus_tests(an, maps, idx2num) if not an.trace.get("import") else {}
                     if an.trace.get("import"):
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
+                    elif RT_DROP_RUN and len(plan.run) > RT_DROP_MIN_RUN:
+                        # High-variance rule: a change inside functions is verified on
+                        # a few probes (the tests running most of the changed code, the
+                        # cheapest of each file); the rest only once it is found live.
+                        light = {n for n in plan.run if sec[n] < HEAVY_SEC}
+                        plan.static |= light
+                        plan.run -= light
+                        probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus, limit=PROBE_DROP_RT_N)
                     elif pack(plan.static, dur_ms)[0] / 1000.0 >= PROBE_DROP_RT_MIN:
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus, limit=PROBE_DROP_RT_N)
             if fixed_data:
