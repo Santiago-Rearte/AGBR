@@ -45,6 +45,7 @@ DIVERSE_PROBES = int(os.environ.get("BR_DIVERSE_PROBES", "15"))
 PROBES_PER_HEAVY = int(os.environ.get("BR_PROBES_PER_HEAVY", "6"))
 MIN_PROBES = int(os.environ.get("BR_MIN_PROBES", "3"))
 UNIQUE_MAX = float(os.environ.get("BR_UNIQUE_MAX", "0.005"))
+MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot lines per traced second
 
 
 def log(*args):
@@ -317,7 +318,9 @@ def probe_eligible(maps):
                 bit = 1 << h
                 total = sum(c for sid, c in uses.items() if sets[sid] & bit)
                 own = sum(c for sid, c in uses.items() if sets[sid] == bit)
-                if total and own <= UNIQUE_MAX * total:
+                # Scale-driven tests (few lines, long run: huge inputs, node limits) fail
+                # on changes to cost or limits that small inputs never reveal.
+                if total and own <= UNIQUE_MAX * total and total >= MIN_LINE_RATE * maps["dur"][h]:
                     eligible |= bit
         _ELIGIBLE = eligible
     return _ELIGIBLE
