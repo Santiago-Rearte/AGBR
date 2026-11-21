@@ -273,6 +273,107 @@ def check_lazy_attributes(out, base_all, only):
                 break
 
 
+STATE_BASE = None  # keys.pkl content, set by the parent before forking
+
+
+def check_state(out, sc):
+    """Import-time state of the patched tree vs the base: only the edited entries of
+    the edited class dicts (and same-named copies) may differ.  Writes STATEOK or
+    STATEDIFF."""
+    try:
+        for mod in sc["modules"]:
+            try:
+                importlib.import_module(mod)
+            except BRTimeout:
+                raise
+            except BaseException as error:  # noqa: BLE001
+                out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
+                out.write("STATEDIFF import\n")
+                return
+        # Every module, as for the base state: registries filled on import (dialect
+        # classes) and derived tables anywhere are compared like for like.
+        import pkgutil
+
+        import sqlglot
+
+        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+            if info.name != "sqlglot.__main__":
+                try:
+                    importlib.import_module(info.name)
+                except BRTimeout:
+                    raise
+                except BaseException:  # noqa: BLE001 - the base swallowed these too
+                    pass
+        import statefp
+
+        base = STATE_BASE or {}
+        loaded = {m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")}
+        bad = statefp.diff(
+            base.get("state", {}),
+            statefp.state(loaded),
+            {k: set(v) for k, v in sc["allowed"].items()},
+            loaded,
+            base.get("unstable", ()),
+        )
+        out.write("STATEOK\n" if not bad and base else f"STATEDIFF {len(bad)} {bad[:1]}\n")
+    except BRTimeout:
+        out.write("STATEDIFF timeout\nIMPORTHANG\n")
+        raise
+    except BaseException as error:  # noqa: BLE001
+        out.write(f"STATEDIFF error {type(error).__name__}\n")
+
+
+def check_all_modules(out, spec):
+    """In a forked grandchild (so the tests about to run see the usual lazily loaded
+    state): import every sqlglot module, reporting IMPORTFAIL for any failure, then the
+    import-time state check.  Modules loaded lazily (a dialect's generator) may run
+    patched code at import time, e.g. parse SQL templates, and every test importing
+    them would fail at collection.  All of them import cleanly on the base."""
+    out.flush()
+    remaining = signal.getitimer(signal.ITIMER_REAL)[0] or spec.get("import_timeout", 20.0)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            signal.signal(signal.SIGALRM, _alarm)
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            import pkgutil
+
+            import sqlglot
+
+            for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+                if info.name == "sqlglot.__main__" or info.name in sys.modules:
+                    continue
+                try:
+                    importlib.import_module(info.name)
+                except BRTimeout:
+                    raise
+                except BaseException as error:  # noqa: BLE001
+                    out.write(f"IMPORTFAIL {info.name} {type(error).__name__}\n")
+            if spec.get("state_check") is not None:
+                check_state(out, spec["state_check"])
+            out.write("ALLOK\n")
+        except BRTimeout:
+            out.write("IMPORTHANG\n")
+        except BaseException as error:  # noqa: BLE001
+            out.write(f"IMPORTFAIL sqlglot {type(error).__name__}\n")
+        finally:
+            try:
+                out.flush()
+            except Exception:
+                pass
+            os._exit(0)
+    try:
+        os.waitpid(pid, 0)
+    except BRTimeout:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        out.write("IMPORTHANG\n")
+        raise
+
+
 def child_main(spec, wfd):
     try:
         os.setpgid(0, 0)
@@ -302,6 +403,8 @@ def child_main(spec, wfd):
                             out.write("IMPORTHANG\n")
                             break
                 check_lazy_attributes(out, spec.get("lazy_all", {}), set(spec["import_check"]))
+                if spec.get("import_all", True) or spec.get("state_check") is not None:
+                    check_all_modules(out, spec)
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
             out.write("IMPORTSOK\n")
@@ -377,6 +480,9 @@ class Job:
         self.stopped = False
         self.imports_ok = False
         self.import_hang = False
+        self.state_ok = None
+        self.all_ok = False
+        self.state_msg = ""
         self.pid = None
         self.fd = None
         self.buf = b""
@@ -413,6 +519,13 @@ def _consume(job, data):
             job.import_hang = True
         elif tag == "IMPORTSOK":
             job.imports_ok = True
+        elif tag == "ALLOK":
+            job.all_ok = True
+        elif tag == "STATEOK":
+            job.state_ok = job.state_ok is None
+        elif tag == "STATEDIFF":
+            job.state_ok = False
+            job.state_msg = rest
         elif tag == "STOPPED":
             job.stopped = True
         elif tag == "DONE":

@@ -95,6 +95,7 @@ class Plan:
         self.conditional = set()
         self.stop_on_fail = False
         self.check_imports = False
+        self.keyref = []  # key-level refinements, each with its unrefined fallback
 
 
 def main():
@@ -186,6 +187,9 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                 continue
             bits, notes, static = an.analyze(fps)
             plan.notes.extend(notes)
+            plan.keyref = list(an.trace.get("keyref") or [])
+            if plan.keyref:
+                plan.notes.append("keys(" + ",".join(f"{k['attr']}:{len(k['keys'])}" for k in plan.keyref) + ")")
             cands = {idx2num[i] for i in analysis.iter_bits(bits) if idx2num[i] >= 0}
             if not static and DOMINANCE:
                 dom = dominated_heavy(an, bits, idx_sec, cheap_all)
@@ -239,6 +243,15 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             nums |= p.conditional
         if p.job is not None and not p.run and not p.job.done:
             nums |= set(all_nums)  # the import check itself did not finish
+        if p.keyref and (p.job is None or p.job.state_ok is not True):
+            # The import-time state check did not prove the edit confined to the
+            # edited dict entries: use the unrefined selection.
+            fb = 0
+            for info in p.keyref:
+                fb |= info["fallback"]
+            nums |= {idx2num[i] for i in analysis.iter_bits(fb) if idx2num[i] >= 0}
+            msg = p.job.state_msg if p.job is not None else "no check"
+            log(f"{p.commit}: key refinement not confirmed ({msg[:160]}), unrefined selection")
         results[p.commit] = sorted(n for n in nums if n in dur_ms)
         cost, workers = pack(results[p.commit], dur_ms)
         log(f"{p.commit}: selected={len(results[p.commit])} cost={cost / 1000:.3f}s workers={len(workers)}")
@@ -551,6 +564,16 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             # Once a cheap test fails the dominated heavy tests are selected anyway.
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
         }
+        if p.keyref:
+            allowed = {}
+            for info in p.keyref:
+                for k, v in info["allowed"].items():
+                    allowed.setdefault(k, set()).update(v)
+            spec["state_check"] = {
+                "modules": sorted({m for info in p.keyref for m in info["modules"]}),
+                "allowed": {k: sorted(v) for k, v in allowed.items()},
+            }
+            runner.STATE_BASE = an.keydata()
         job = runner.Job(p.commit, spec, budget)
         job.plan = p
         p.job = job
@@ -569,10 +592,15 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             f"{p.commit}: verified {len(job.passed)}/{len(p.run)} pass, cpu={job.cpu:.2f}s wall={job.wall:.2f}s"
             f" done={job.done} crash={job.crashed}"
         )
-        if job.spec.get("import_check") and (not job.imports_ok or job.import_hang):
+        if job.spec.get("import_check") and (not job.imports_ok or job.import_hang or not job.all_ok):
             # The import check itself crashed, hung or was killed: assume the patched
             # code breaks every importer.
             log(f"{p.commit}: import check did not complete, selecting everything")
+            p.extra |= set(id2num.values())
+        if job.import_failed:
+            # A module that imports cleanly on the base no longer does: every test
+            # file importing it (even transitively, at collection) fails.
+            log(f"{p.commit}: import failures {sorted(job.import_failed)[:3]}, selecting everything")
             p.extra |= set(id2num.values())
         for mod in job.import_failed:
             rel = mod.replace(".", "/")

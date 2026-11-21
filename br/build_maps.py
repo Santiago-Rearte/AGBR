@@ -26,7 +26,8 @@ def main(raw_dir, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     repo = os.getcwd()
 
-    contexts = defaultdict(lambda: [set(), set(), set(), set(), set()])
+    contexts = defaultdict(lambda: [set(), set(), set(), set(), set(), set()])
+    tracked = {}
     durations, outcomes = {}, {}
     file_index, files = {}, []
 
@@ -53,8 +54,16 @@ def main(raw_dir, out_dir):
                 for fn in data["new_files"]:
                     rel = os.path.relpath(fn, repo).replace(os.sep, "/")
                     remap.append(fidx(rel))
-                for name, (lines, reads, dirs, funcs, inst) in data["ctx"].items():
+                for key, label in (data.get("tracked") or {}).items():
+                    if label is None or tracked.get(key, label) is None:
+                        tracked[key] = None  # aliased somewhere: never refined
+                    else:
+                        tracked[key] = label
+                for name, rec_in in data["ctx"].items():
+                    lines, reads, dirs, funcs, inst = rec_in[:5]
                     rec = contexts[name]
+                    if len(rec_in) > 5:
+                        rec[5].update(rec_in[5])
                     rec[0].update(remap[k // 1_000_000] * 1_000_000 + k % 1_000_000 for k in lines)
                     rec[1].update(reads)
                     rec[2].update(dirs)
@@ -83,8 +92,8 @@ def main(raw_dir, out_dir):
         by_class[tclass(t)] |= 1 << i
 
     # Group-level contexts: class setup/teardown phases and module collection.
-    group_ctx = defaultdict(lambda: [set(), set(), set(), set(), set()])
-    per_test = defaultdict(lambda: [set(), set(), set(), set(), set()])
+    group_ctx = defaultdict(lambda: [set(), set(), set(), set(), set(), set()])
+    per_test = defaultdict(lambda: [set(), set(), set(), set(), set(), set()])
     for name, rec in contexts.items():
         if name.startswith("collect|"):
             target = ("file", name[len("collect|") :])
@@ -94,7 +103,7 @@ def main(raw_dir, out_dir):
             if nodeid not in index:
                 continue
             dest = per_test[nodeid]
-            for k in range(5):
+            for k in range(6):
                 dest[k] |= rec[k]
             if phase in ("setup", "teardown"):
                 dest = group_ctx[("class", tclass(nodeid))]
@@ -102,21 +111,24 @@ def main(raw_dir, out_dir):
                 continue
         else:
             continue
-        for k in range(5):
+        for k in range(6):
             dest[k] |= rec[k]
 
     for (kind, key), rec in group_ctx.items():
         members = [t for t in tests if (tfile(t) if kind == "file" else tclass(t)) == key]
         for t in members:
             dest = per_test[t]
-            for k in range(5):
+            for k in range(6):
                 dest[k] |= rec[k]
 
     # Inverted indexes.
     line_tests = defaultdict(list)
     reads, dirs, funcs, inst = (defaultdict(list) for _ in range(4))
+    key_tests = defaultdict(list)
     for t, rec in per_test.items():
         i = index[t]
+        for lk in rec[5]:
+            key_tests[lk].append(i)
         for key in rec[0]:
             line_tests[key].append(i)
         for r in rec[1]:
@@ -175,6 +187,7 @@ def main(raw_dir, out_dir):
         if (name == "sqlglot" or name.startswith("sqlglot.")) and "__getattr__" in vars(module)
     }
     print(f"  lazy modules: {sorted(maps['lazy_all'])}", file=sys.stderr)
+    write_keys(out_dir, tracked, key_tests, bits)
     with open(os.path.join(out_dir, "maps.pkl"), "wb") as fh:
         pickle.dump(maps, fh, protocol=pickle.HIGHEST_PROTOCOL)
     bad = {t: o for t, o in outcomes.items() if o != "passed"}
@@ -185,6 +198,62 @@ def main(raw_dir, out_dir):
     )
     for t, o in sorted(bad.items())[:20]:
         print(f"  base {o}: {t}", file=sys.stderr)
+
+
+def write_keys(out_dir, tracked, key_tests, bits):
+    """keys.pkl: per tracked class dict, the tests that read each key ("*": the whole
+    dict), plus which "module:Class.attr" dicts were tracked under which label."""
+    set_ids, sets = {}, []
+    reads = defaultdict(dict)
+    for (label, kc), indices in key_tests.items():
+        tup = tuple(sorted(set(indices)))
+        sid = set_ids.get(tup)
+        if sid is None:
+            sid = set_ids[tup] = len(sets)
+            sets.append(bits(tup))
+        reads[label][kc] = sid
+    # Base import-time state of every sqlglot module (imported alone, as the run-time
+    # import check does), and the entries that differ under another hash seed.
+    import subprocess
+
+    code = chr(10).join([
+        "import sys, pickle, pkgutil, importlib",
+        "sys.path.insert(0, %r)" % os.path.dirname(os.path.abspath(__file__)),
+        # As at run time, where the runner has pytest loaded before sqlglot.
+        "import pytest, unittest, statefp, sqlglot",
+        "for info in pkgutil.walk_packages(sqlglot.__path__, prefix='sqlglot.'):",
+        "    if info.name != 'sqlglot.__main__':",
+        "        try: importlib.import_module(info.name)",
+        "        except BaseException: pass",
+        "pickle.dump(statefp.state(), open(sys.argv[1], 'wb'))",
+    ])
+    states = []
+    for seed in ("1", "2"):
+        path = os.path.join(out_dir, f"state{seed}.pkl")
+        env = dict(os.environ, PYTHONHASHSEED=seed)
+        subprocess.run([sys.executable, "-c", code, path], env=env, capture_output=True)
+        try:
+            with open(path, "rb") as fh:
+                states.append(pickle.load(fh))
+            os.remove(path)
+        except Exception as error:
+            print(f"  state run failed: {error!r}", file=sys.stderr)
+    state, unstable = {}, set()
+    if len(states) == 2:
+        state = states[0]
+        unstable = {k for k in set(state) | set(states[1]) if state.get(k) != states[1].get(k)}
+    with open(os.path.join(out_dir, "keys.pkl"), "wb") as fh:
+        pickle.dump(
+            {"tracked": tracked, "reads": dict(reads), "sets": sets, "state": state, "unstable": unstable},
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    print(f"  state: {len(state)} entries, unstable={sorted(unstable)[:6]}", file=sys.stderr)
+    print(
+        f"  key reads: tracked={sum(1 for v in tracked.values() if v)} untracked={sum(1 for v in tracked.values() if v is None)} "
+        f"labels={len(reads)} keys={len(key_tests)} sets={len(sets)}",
+        file=sys.stderr,
+    )
 
 
 def coverage_neighbours(tests, index, per_test, files, durations, slow=0.8, keep=60):

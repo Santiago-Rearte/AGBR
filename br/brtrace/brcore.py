@@ -35,7 +35,7 @@ CODE_KIND = {}
 
 DATA = {}
 CTX = None
-L = R = D = F = I = None
+L = R = D = F = I = K = None
 CHILD_MODE = False
 STARTED = False
 
@@ -127,15 +127,15 @@ def on_line(code, line):
 
 
 def _new():
-    return [set(), set(), set(), set(), set()]
+    return [set(), set(), set(), set(), set(), set()]
 
 
 def set_ctx(name):
-    global L, R, D, F, I, CTX
+    global L, R, D, F, I, K, CTX
     rec = DATA.get(name)
     if rec is None:
         rec = DATA[name] = _new()
-    L, R, D, F, I = rec
+    L, R, D, F, I, K = rec
     CTX = name
     if STARTED:
         M.restart_events()
@@ -215,10 +215,13 @@ def flush(fh, keep_current=True, extra=None):
     for name in list(DATA):
         if keep_current and name == CTX:
             continue
-        l, r, d, f, i = DATA.pop(name)
-        if l or r or d or f or i:
-            out[name] = (l, r, d, f, _names(i))
+        l, r, d, f, i, k = DATA.pop(name)
+        if l or r or d or f or i or k:
+            out[name] = (l, r, d, f, _names(i), {(lab, key_canon(x)) for lab, x in k})
     record = {"files_base": _FLUSHED_FILES, "new_files": FILES[_FLUSHED_FILES:], "ctx": out}
+    if TRACKED_NEW:
+        record["tracked"] = dict(TRACKED_NEW)
+        TRACKED_NEW.clear()
     if extra:
         record.update(extra)
     _FLUSHED_FILES = len(FILES)
@@ -257,6 +260,261 @@ def start_child():
                 sys.stderr.write(f"brtrace child dump failed: {error}\n")
 
     atexit.register(_dump)
+
+
+# ---------------------------------------------------------------------------
+# Key reads of large class-level dicts (KEYWORDS, FUNCTIONS, TRANSFORMS...).
+#
+# After a sqlglot module is imported, each such dict that only class namespaces
+# refer to is replaced by a TrackDict copy.  Lookups record (label, key); anything
+# that can see the whole content (iteration, views, len, copies, merges, equality)
+# records (label, ALL).  Dicts aliased elsewhere are left alone and reported as
+# untracked, so the analysis never relies on them.
+
+ALL = "\x00*"
+MIN_TRACK = 16
+TRACK_KEYS = os.environ.get("BR_TRACK_KEYS", "1") == "1"
+TRACKED = {}  # id(original dict) -> (original, TrackDict); originals kept alive
+TRACKED_NEW = {}  # "module:Qual.attr" -> label (None: untracked), not yet flushed
+
+
+def key_canon(k):
+    import enum
+
+    if k is ALL:
+        return "*"
+    if isinstance(k, enum.Enum):
+        return f"e:{type(k).__name__}.{k.name}"
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, type):
+        return "c:" + k.__name__
+    if k is None or isinstance(k, (bool, int, float)):
+        return "r:" + repr(k)
+    return "o:" + type(k).__name__
+
+
+def _kread(d, key):
+    if K is not None:
+        K.add((d._br_label, key))
+
+
+def _kall(d):
+    if K is not None:
+        K.add((d._br_label, ALL))
+
+
+class TrackDict(dict):
+    __slots__ = ("_br_label",)
+
+    def __getitem__(self, key):
+        if K is not None:
+            K.add((self._br_label, key))
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        if K is not None:
+            K.add((self._br_label, key))
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        if K is not None:
+            K.add((self._br_label, key))
+        return dict.__contains__(self, key)
+
+    def setdefault(self, key, default=None):
+        if K is not None:
+            K.add((self._br_label, key))
+        return dict.setdefault(self, key, default)
+
+    def pop(self, key, *default):
+        if K is not None:
+            K.add((self._br_label, key))
+        return dict.pop(self, key, *default)
+
+    def __setitem__(self, key, value):
+        if K is not None:
+            K.add((self._br_label, key))
+        dict.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        if K is not None:
+            K.add((self._br_label, key))
+        dict.__delitem__(self, key)
+
+    def __iter__(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__iter__(self)
+
+    def __reversed__(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__reversed__(self)
+
+    def __len__(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__len__(self)
+
+    def keys(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.keys(self)
+
+    def values(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.values(self)
+
+    def items(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.items(self)
+
+    def copy(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict(dict.items(self))
+
+    def __or__(self, other):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__or__(dict(dict.items(self)), other)
+
+    def __ror__(self, other):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__or__(dict(other), dict(dict.items(self)))
+
+    def __ior__(self, other):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        dict.update(self, other)
+        return self
+
+    def update(self, *args, **kwargs):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        dict.update(self, *args, **kwargs)
+
+    def popitem(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.popitem(self)
+
+    def clear(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        dict.clear(self)
+
+    def __eq__(self, other):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__ne__(self, other)
+
+    __hash__ = None
+
+    def __repr__(self):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return dict.__repr__(self)
+
+    def __reduce_ex__(self, protocol):
+        if K is not None:
+            K.add((self._br_label, ALL))
+        return (dict, (dict(dict.items(self)),))
+
+    def __sizeof__(self):
+        return dict.__sizeof__(self)
+
+
+def _module_classes(module, name):
+    out, stack = [], [v for v in vars(module).values() if isinstance(v, type) and v.__module__ == name]
+    seen = set()
+    while stack:
+        c = stack.pop()
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        out.append(c)
+        prefix = c.__qualname__ + "."
+        for v in list(vars(c).values()):
+            if isinstance(v, type) and v.__module__ == name and v.__qualname__.startswith(prefix):
+                stack.append(v)
+    return out
+
+
+def track_module_dicts(module):
+    import gc
+
+    name = getattr(module, "__name__", "")
+    if not (name == "sqlglot" or name.startswith("sqlglot.")):
+        return
+    try:
+        classes = _module_classes(module, name)
+    except Exception:
+        return
+    import enum
+
+    cands = []
+    for c in classes:
+        if issubclass(c, enum.Enum):
+            continue
+        for attr, val in list(vars(c).items()):
+            if attr.startswith("_"):
+                continue
+            if type(val) is dict and len(val) >= MIN_TRACK:
+                cands.append((c, attr, val))
+            elif type(val) is TrackDict:
+                TRACKED_NEW[f"{name}:{c.__qualname__}.{attr}"] = val._br_label
+    if not cands:
+        return
+    namespaces = set()
+    for c in classes:
+        for x in gc.get_referents(c):
+            if type(x) is dict:
+                namespaces.add(id(x))
+    targets = {id(v): v for _, _, v in cands}
+    tl = list(targets.values())
+    mine = {id(cands), id(targets), id(tl), id(sys._getframe())} | {id(t) for t in cands}
+    aliased = set()
+    module_dict = vars(module)
+    for r in gc.get_referrers(*tl):
+        if id(r) in namespaces or id(r) in mine:
+            continue
+        if type(r) is tuple and len(r) == len(tl) and all(a is b for a, b in zip(r, tl)):
+            continue  # the argument tuple of this very call
+        if r is module_dict:
+            continue  # module-level aliases are re-pointed below
+        for x in gc.get_referents(r):
+            if id(x) in targets:
+                aliased.add(id(x))
+    for c, attr, val in cands:
+        key = f"{name}:{c.__qualname__}.{attr}"
+        if id(val) in aliased:
+            TRACKED_NEW[key] = None
+            continue
+        hit = TRACKED.get(id(val))
+        td = hit[1] if hit is not None and hit[0] is val else None
+        if td is None:
+            td = TrackDict(val)
+            td._br_label = key
+            TRACKED[id(val)] = (val, td)
+            for g, gv in list(module_dict.items()):
+                if gv is val:
+                    module_dict[g] = td
+        try:
+            setattr(c, attr, td)
+        except Exception:
+            TRACKED_NEW[key] = None
+            continue
+        TRACKED_NEW[key] = td._br_label
 
 
 # ---------------------------------------------------------------------------
@@ -301,32 +559,48 @@ def install_import_hooks(defeat_caches=True):
         original = loader.exec_module
 
         def exec_module(self, module, _original=original):
+            global K
             prev = CTX
             name = getattr(module, "__name__", "")
-            switch = IMPORT_CTX and STARTED and (name == "sqlglot" or name.startswith("sqlglot."))
+            ours = name == "sqlglot" or name.startswith("sqlglot.")
+            switch = IMPORT_CTX and STARTED and ours
             if switch:
                 set_ctx("import|" + name)
+            # Dict reads while a sqlglot module executes build import-time state
+            # (merged copies, tries), which the run-time state check compares; they
+            # are not reads by the test that happened to trigger the import.
+            saved_k = K
+            if ours:
+                K = None
             try:
                 _original(self, module)
             finally:
+                if ours and K is None:
+                    K = saved_k
                 if switch:
                     set_ctx(prev)
                 if defeat_caches:
                     _defeat_caches(module)
+                if TRACK_KEYS:
+                    track_module_dicts(module)
 
         loader.exec_module = exec_module
     if defeat_caches:
         for name, module in list(sys.modules.items()):
             _defeat_caches(module)
+    if TRACK_KEYS:
+        for name, module in list(sys.modules.items()):
+            track_module_dicts(module)
 
 
 def import_trace_main(out_path):
     """Imports every sqlglot module, attributing lines to the module being executed."""
-    global IMPORT_CTX
+    global IMPORT_CTX, TRACK_KEYS
     import importlib
     import pkgutil
 
     IMPORT_CTX = True
+    TRACK_KEYS = False
     install_import_hooks(defeat_caches=False)
     start("import|<root>")
     import sqlglot

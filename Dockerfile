@@ -28,7 +28,7 @@ RUN cd /opt/sqlglot && mkdir -p /opt/raw \
     BR_REPO=/opt/sqlglot PYTHONPATH=/opt/sqlglot python /opt/br/brtrace/brcore.py /opt/raw/import.trace
 
 # 4. Compact maps from the raw traces.
-COPY br/build_maps.py /opt/br/build_maps.py
+COPY br/build_maps.py br/statefp.py /opt/br/
 RUN cd /opt/sqlglot && PYTHONPATH=/opt/sqlglot python /opt/br/build_maps.py /opt/raw /opt/maps \
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
  && chmod -R a+rX /opt

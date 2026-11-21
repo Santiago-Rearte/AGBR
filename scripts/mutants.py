@@ -128,9 +128,13 @@ def main():
     print(f"base run: {len(base_fail)} failing in this environment ({time.monotonic() - t0:.0f}s): {sorted(base_fail)[:5]}", flush=True)
     summary = []
     for k in range(n):
-        rel, ln, label, patch, new_text = mutate(rng, files)
-        fps = patchlib.parse(patch)
-        bits, notes, static = an.analyze(fps)
+        while True:
+            rel, ln, label, patch, new_text = mutate(rng, files)
+            fps = patchlib.parse(patch)
+            bits, notes, static = an.analyze(fps)
+            # dev: BR_MUT_KEYREF=1 keeps only mutants the key-level refinement applies to
+            if os.environ.get("BR_MUT_KEYREF") != "1" or an.trace.get("keyref"):
+                break
         cands = {tests[i] for i in analysis.iter_bits(bits)}
         root = f"/tmp/mut{k}"
         runner.make_overlay(root, REPO, {rel: new_text})
@@ -139,9 +143,26 @@ def main():
         if an.trace.get("import") or an.trace.get("import_mods"):
             mods = sorted({analysis.modname(rel)} | set(an.trace.get("import_mods", ())))
             mods = [m for m in mods if m and m.startswith("sqlglot")]
-            chk = runner.Job("chk", {"root": root, "nodeids": [], "import_check": mods, "lazy_all": maps.get("lazy_all", {})}, 120)
+            spec = {"root": root, "nodeids": [], "import_check": mods, "lazy_all": maps.get("lazy_all", {})}
+            keyref = an.trace.get("keyref") or []
+            if keyref:
+                allowed = {}
+                for info in keyref:
+                    for kk, v in info["allowed"].items():
+                        allowed.setdefault(kk, set()).update(v)
+                spec["state_check"] = {
+                    "modules": sorted({m for info in keyref for m in info["modules"]}),
+                    "allowed": {kk: sorted(v) for kk, v in allowed.items()},
+                }
+                runner.STATE_BASE = an.keydata()
+            chk = runner.Job("chk", spec, 120)
             runner.run_jobs([chk], parallel=1)
-            if chk.import_failed or not chk.done or not chk.imports_ok or chk.import_hang:
+            if keyref and chk.state_ok is not True:
+                fb = 0
+                for info in keyref:
+                    fb |= info["fallback"]
+                cands |= {tests[i] for i in analysis.iter_bits(fb)}
+            if chk.import_failed or not chk.done or not chk.imports_ok or chk.import_hang or not chk.all_ok:
                 import_failed = True
                 cands = set(tests)
         t0 = time.monotonic()
@@ -158,6 +179,8 @@ def main():
             "n_missing": len(missing),
             "notes": notes,
             "import_failed": import_failed,
+            "keyref": [(info["attr"], len(info["keys"])) for info in (an.trace.get("keyref") or [])],
+            "state_ok": chk.state_ok if an.trace.get("import") or an.trace.get("import_mods") else None,
             "secs": round(time.monotonic() - t0, 1),
         }
         summary.append(rec)

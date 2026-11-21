@@ -18,6 +18,8 @@ DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 STMTLIKE = (ast.stmt, ast.excepthandler, ast.match_case)
 BLOCK_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
 PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"}
+KEY_REFINE = os.environ.get("BR_KEY_REFINE", "1") == "1"
+KEYS_PATH = os.path.join(os.environ.get("BR_MAPS", "/opt/maps"), "keys.pkl")
 
 
 def log(*args):
@@ -216,7 +218,9 @@ class Analyzer:
         self.import_lines = maps.get("import_lines", {})
         self.mod_classes = maps.get("mod_classes", {})
         self.eager = set(maps.get("eager", ()))
-        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set()}
+        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set(), "keyref": []}
+        self.keys = None
+        self._new_tree = None
 
     def release(self):
         """Forgets cached ASTs and sources (they are rebuilt on demand)."""
@@ -452,7 +456,7 @@ class Analyzer:
             return bits | self.class_level(rel, classes + [cls_hdr], None, depth, header=True)
         stmt = self._changed_stmt(site, classes)
         if classes:
-            return bits | self.class_level(rel, classes, stmt, depth)
+            return bits | self.class_level(rel, classes, stmt, depth, site=site)
         return bits | self.module_level(rel, stmt, depth)
 
     def _changed_stmt(self, site, classes):
@@ -507,7 +511,22 @@ class Analyzer:
             bits |= inst.get(k, 0) | self._test_class_bits(k)
         return bits, kept
 
-    def class_level(self, rel, chain, stmt, depth, header=False):
+    def class_level(self, rel, chain, stmt, depth, header=False, site=None):
+        bits = self._class_level(rel, chain, stmt, depth, header)
+        if depth == 0 and site is not None and KEY_REFINE:
+            try:
+                refined = self.key_refine(rel, chain, stmt, site)
+            except Exception as error:  # never let the refinement crash the analysis
+                log(f"  key refinement error on {rel}: {error!r}")
+                refined = None
+            if refined is not None:
+                rbits, info = refined
+                info["fallback"] = bits
+                self.trace["keyref"].append(info)
+                return rbits | self.reads(rel)
+        return bits
+
+    def _class_level(self, rel, chain, stmt, depth, header=False):
         cls = chain[-1]
         mod = modname(rel) or ""
         qual = ".".join(c.name for c in chain)
@@ -681,6 +700,161 @@ class Analyzer:
         self._memo[key] = result
         return result
 
+    # -- key-level refinement of class dict entries ------------------------------
+
+    def keydata(self):
+        if self.keys is None:
+            import pickle
+
+            try:
+                with open(KEYS_PATH, "rb") as fh:
+                    self.keys = pickle.load(fh)
+            except Exception:
+                self.keys = {}
+        return self.keys
+
+    @staticmethod
+    def static_key(k):
+        """Canonical forms (as brcore.key_canon writes them) a dict key expression
+        may take at run time, or None when unknown."""
+        if isinstance(k, ast.Constant):
+            v = k.value
+            if isinstance(v, str):
+                return frozenset({"s:" + v})
+            if v is None or isinstance(v, (bool, int, float)):
+                return frozenset({"r:" + repr(v)})
+            return None
+        if isinstance(k, ast.Attribute):
+            out = {"c:" + k.attr}
+            base = k.value
+            bname = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else None
+            if bname:
+                out.add(f"e:{bname}.{k.attr}")
+            return frozenset(out)
+        return None
+
+    def _display(self, d):
+        spreads, final = [], {}
+        for k, v in zip(d.keys, d.values):
+            if k is None:
+                spreads.append(v)
+                continue
+            kc = self.static_key(k)
+            if kc is None:
+                return None
+            final[kc] = v
+        return spreads, final
+
+    def _follow_new(self, site, pos):
+        cur = self._new_tree
+        for _n, f, i in site[:pos]:
+            nxt = getattr(cur, f, None)
+            if isinstance(i, int):
+                if not isinstance(nxt, list) or i >= len(nxt):
+                    return None
+                nxt = nxt[i]
+            elif i is not None:
+                return None
+            cur = nxt
+            if cur is None:
+                return None
+        return cur
+
+    def mentioning_modules(self, name):
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        out = set()
+        for rel, text in self.corpus().items():
+            if rel.startswith("sqlglot/") and pat.search(text):
+                mod = modname(rel)
+                if mod:
+                    out.add(mod)
+        return out
+
+    def key_refine(self, rel, chain, stmt, site):
+        """Tests that read an edited key of a class-level dict display.
+
+        Applies when the change lies inside the entries of `ATTR = {...}`: the
+        readers are the tests that looked those keys up (or saw the whole dict) in
+        any tracked dict of that name.  Returns (bits, info) or None; info tells the
+        run-time import check which state may differ, and the selector falls back to
+        the unrefined set when anything else changed."""
+        if self._new_tree is None or not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            return None
+        if not isinstance(stmt.value, ast.Dict):
+            return None
+        names = bound_names(stmt)
+        if len(names) != 1:
+            return None
+        attr = next(iter(names))
+        pos = next((j for j, (n, _f, _i) in enumerate(site) if n is stmt), None)
+        if pos is None or site[pos][1] != "value":
+            return None
+        new_stmt = self._follow_new(site, pos)
+        if type(new_stmt) is not type(stmt) or not isinstance(new_stmt.value, ast.Dict):
+            return None
+        if bound_names(new_stmt) != names:
+            return None
+        if isinstance(stmt, ast.AnnAssign) and not ast_equal(stmt.annotation, new_stmt.annotation):
+            return None
+        old_d, new_d = self._display(stmt.value), self._display(new_stmt.value)
+        if old_d is None or new_d is None:
+            return None
+        if len(old_d[0]) != len(new_d[0]) or not all(ast_equal(a, b) for a, b in zip(old_d[0], new_d[0])):
+            return None
+        changed = set()
+        for kc in set(old_d[1]) | set(new_d[1]):
+            a, b = old_d[1].get(kc), new_d[1].get(kc)
+            if a is None or b is None or not ast_equal(a, b):
+                changed |= kc
+        kd = self.keydata()
+        base = kd.get("state") or {}
+        tracked = kd.get("tracked") or {}
+        if not base or not tracked:
+            return None
+        mod = modname(rel) or ""
+        qual = ".".join(c.name for c in chain)
+        own = f"{mod}:{qual}.{attr}"
+        if not tracked.get(own) or not isinstance(base.get(own), dict):
+            return None
+        fam = set(self.m.get("family", {}).get(f"{mod}:{qual}", [f"{mod}:{qual}"]))
+        suffix = "." + attr
+        same_name = [k for k, v in base.items() if k.endswith(suffix) and isinstance(v, dict) and "." in k.split(":", 1)[1]]
+        own_base = base[own]
+        owners = []
+        for k in same_name:
+            # Dicts that can hold the edited entries: the class's own, its subclasses'
+            # (inherited or merged copies), and any other dict whose entry for an
+            # edited key is identical to this one's (a copy made elsewhere).
+            if k == own or k[: -len(suffix)] in fam or any(
+                x in own_base and base[k].get(x) == own_base[x] for x in changed
+            ):
+                if not tracked.get(k):
+                    return None  # a copy that may hold an edited key is not tracked
+                owners.append(k)
+        reads, sets = kd["reads"], kd["sets"]
+        bits = 0
+        for label in {tracked[k] for k in owners if tracked.get(k)}:
+            r = reads.get(label) or {}
+            for kc in changed | {"*"}:
+                sid = r.get(kc)
+                if sid is not None:
+                    bits |= sets[sid]
+        # Lambdas and functions inside the edited entries.
+        for k, v in zip(stmt.value.keys, stmt.value.values):
+            kc = self.static_key(k) if k is not None else None
+            if kc and kc & changed:
+                bits |= self.func_lines_bits(rel, v)
+        modules = {k.split(":", 1)[0] for k in owners} | {c.split(":", 1)[0] for c in fam}
+        modules |= self.mentioning_modules(attr)
+        info = {
+            "allowed": {k: sorted(changed) for k in owners},
+            "modules": sorted(m for m in modules if m),
+            "attr": attr,
+            "keys": sorted(changed),
+        }
+        return bits, info
+
+
     def func_lines_bits(self, rel, node):
         """Tests that ran any function or lambda defined inside node.
 
@@ -821,7 +995,7 @@ class Analyzer:
 
         self.trace then says whether every change was a statement inside a function
         ("runtime" sites with their line units and enclosing function span)."""
-        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set()}
+        self.trace = {"runtime": [], "other": False, "import": False, "nonsite": False, "import_mods": set(), "keyref": []}
         bits = 0
         notes = []
         static = False
@@ -888,8 +1062,12 @@ class Analyzer:
             return self.reads(path), "noop", False
         sites = ast_diff(old_tree, new_tree)
         bits = 0
-        for site in sites:
-            bits |= self.site_bits(path, site)
+        self._new_tree = new_tree
+        try:
+            for site in sites:
+                bits |= self.site_bits(path, site)
+        finally:
+            self._new_tree = None
         return bits, f"sites={len(sites)}", False
 
     def broken_module(self, rel):
