@@ -569,7 +569,9 @@ class Analyzer:
             if header:
                 pats.append(r"\b" + re.escape(cls.name) + r"\b")
             if pats:
-                bits |= self.refs_bits(re.compile("|".join(pats)), rel, depth + 1, skip_span=span(cls))
+                bits |= self.refs_bits(re.compile("|".join(pats)), rel, depth + 1, skip_span=span(cls),
+                    literal=[cls.name] if header else [f"{cls.name}.{n}" for n in names],
+                )
         return bits
 
     def holder_bits(self, rel, chain):
@@ -590,7 +592,7 @@ class Analyzer:
         files = [rel] + [f for f in self.importer_files(rel) if f != rel] if len(chain) == 1 else [rel]
         for f in files:
             text = self.corpus().get(f)
-            if text is None or not pat.search(text):
+            if text is None or name not in text or not pat.search(text):
                 continue
             for ln in {text.count("\n", 0, m.start()) + 1 for m in pat.finditer(text)}:
                 path = self.locate(f, ln)
@@ -648,8 +650,9 @@ class Analyzer:
         copiers = 0
         hits = 0
         result = None
+        literals = sorted(names)
         for rel, text in self.corpus().items():
-            if not pat.search(text):
+            if not any(n in text for n in literals) or not pat.search(text):
                 continue
             lines_hit = sorted({text.count("\n", 0, m.start()) + 1 for m in pat.finditer(text)})
             hits += len(lines_hit)
@@ -925,18 +928,26 @@ class Analyzer:
         if parent:
             pats.append(r"from\s+" + re.escape(parent) + r"\s+import[^\n]*\b" + re.escape(last) + r"\b")
         pat = re.compile("|".join(pats))
-        files = [f for f, text in self.corpus().items() if f != rel and pat.search(text)]
+        files = [
+            f
+            for f, text in self.corpus().items()
+            if f != rel and (mod in text or (parent and parent in text and last in text)) and pat.search(text)
+        ]
         self._memo[key] = files
         return files
 
-    def refs_bits(self, pattern, origin_rel, depth, skip_span=None):
-        """Tests that execute code matching pattern anywhere in the repo."""
+    def refs_bits(self, pattern, origin_rel, depth, skip_span=None, literal=None):
+        """Tests that execute code matching pattern anywhere in the repo.
+
+        literal: substrings one of which every match contains (a cheap prefilter)."""
         key = ("refs", pattern.pattern, origin_rel, depth)
         if key in self._memo:
             return self._memo[key]
         self._memo[key] = 0
         bits = 0
         for rel, text in self.corpus().items():
+            if literal is not None and not any(x in text for x in literal):
+                continue
             if pattern.search(text):
                 bits |= self.refs_in_file(rel, pattern, depth, skip_span if rel == origin_rel else None)
         self._memo[key] = bits
