@@ -67,6 +67,25 @@ def header_span(n):
     return (lo, max(lo, first - 1))
 
 
+def ast_equal(a, b):
+    """Structural equality of two ASTs, ignoring positions (like comparing ast.dump)."""
+    stack = [(a, b)]
+    while stack:
+        x, y = stack.pop()
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, ast.AST):
+            for f in x._fields:
+                stack.append((getattr(x, f, None), getattr(y, f, None)))
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                return False
+            stack.extend(zip(x, y))
+        elif x != y:
+            return False
+    return True
+
+
 def ast_diff(a, b):
     """Sites where the two trees differ. A site is the list of steps from the root:
     (node, field, index) where index is an int, None, or ("ins", position)."""
@@ -74,7 +93,7 @@ def ast_diff(a, b):
 
     def same(x, y):
         if isinstance(x, ast.AST) and isinstance(y, ast.AST):
-            return ast.dump(x) == ast.dump(y)
+            return ast_equal(x, y)
         return type(x) is type(y) and x == y
 
     def rec(x, y, path):
@@ -800,7 +819,7 @@ class Analyzer:
         except (SyntaxError, ValueError):
             return self.broken_module(path), "syntax", True
         old_tree = self.tree(path)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if ast_equal(old_tree, new_tree):
             return self.reads(path), "noop", False
         sites = ast_diff(old_tree, new_tree)
         bits = 0

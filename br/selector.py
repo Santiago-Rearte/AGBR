@@ -30,7 +30,7 @@ FILE_OVERHEAD = float(os.environ.get("BR_FILE_OVERHEAD", "0.12"))
 POOL_OVERHEAD = float(os.environ.get("BR_POOL_OVERHEAD", "0.3"))
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.15"))
 FAIL_PRIOR = float(os.environ.get("BR_FAIL_PRIOR", "0.5"))
-DATA_FAIL_PRIOR = float(os.environ.get("BR_DATA_FAIL_PRIOR", "0.85"))
+DATA_FAIL_PRIOR = float(os.environ.get("BR_DATA_FAIL_PRIOR", "0.95"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 CALIB = {}
@@ -84,6 +84,7 @@ class Plan:
         self.fail_prior = FAIL_PRIOR
         self.dominated = set()
         self.conditional = set()
+        self.stop_on_fail = False
 
 
 def main():
@@ -306,6 +307,7 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
     runnable.sort(key=lambda n: (run_cost(n), n))
     best_cost = pack(cands | from_fixed, dur_ms)[0] / 1000.0
     best_j = 0
+    best_stop = False
     run_sum = overhead
     files = set()
     classes = set()
@@ -321,14 +323,30 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
             classes.add(c)
             run_sum += setup_cpu.get(c, 0.0)
         rest = never | set(runnable[j:]) | from_fixed
-        # With probability q something fails and the tests run here are selected too.
         q = plan.fail_prior
-        cost = run_sum + (1.0 - q) * pack(rest, dur_ms)[0] / 1000.0
-        cost += q * pack(rest | set(runnable[:j]), dur_ms)[0] / 1000.0
-        if cost < best_cost:
-            best_cost, best_j = cost, j
+        p_rest = pack(rest, dur_ms)[0] / 1000.0
+        p_all = pack(rest | set(runnable[:j]), dur_ms)[0] / 1000.0
+        # Full run: on a live change about half of the run tests fail and are selected.
+        if j == 1:
+            live_full = p_all
+        elif p_rest == 0.0:
+            # At least one failing test is selected: one worker plus the cheapest test.
+            live_full = max(WORKER_MS / 1000.0 + sec[runnable[0]], 0.5 * p_all)
+        else:
+            live_full = p_rest + 0.5 * (p_all - p_rest)
+        full = run_sum + (1.0 - q) * p_rest + q * live_full
+        # Stop at the first failure: a live change costs little CPU, but everything
+        # run is selected (assume half the run happened before the failure).
+        frac = 1.0 if j == 1 else 0.5
+        stop = (1.0 - q) * (run_sum + p_rest) + q * (overhead + frac * (run_sum - overhead) + p_all)
+        for cost, mode in ((full, False), (stop, True)):
+            if cost < best_cost:
+                best_cost, best_j, best_stop = cost, j, mode
     plan.run = set(runnable[:best_j])
     plan.static = from_fixed | (cands - plan.run)
+    plan.stop_on_fail = best_stop and bool(plan.run)
+    if plan.stop_on_fail:
+        plan.notes.append("stop-on-fail")
 
     # Dominance: heavy tests whose code every cheap covering test also runs are only
     # selected when one of those cheap tests fails.
@@ -359,6 +377,7 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
                 best_cost = cost
                 plan.run = set(run_all)
                 plan.conditional = dom
+                plan.stop_on_fail = True
                 plan.static = rest
                 plan.notes.append(f"dominance({len(dom)})")
     plan.notes.append(f"est={best_cost:.2f}s")
@@ -395,7 +414,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "timeouts": timeouts,
             "import_check": p.modules,
             # Once a cheap test fails the dominated heavy tests are selected anyway.
-            "stop_on_fail": bool(p.conditional),
+            "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
         }
         job = runner.Job(p.commit, spec, budget)
         job.plan = p
