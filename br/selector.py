@@ -51,7 +51,17 @@ PROBE_DROP = os.environ.get("BR_PROBE_DROP", "0") == "1"
 # Probe gating of heavy tests also for changes inside functions.
 PROBES_RUNTIME = os.environ.get("BR_PROBES_RUNTIME", "0") == "1"
 PROBE_DROP_RUNTIME = os.environ.get("BR_PROBE_DROP_RUNTIME", "0") == "1"
+# A gated heavy test that meets the strict criteria (STRICT_UNIQUE, STRICT_LINE_RATE)
+# is selected only when one of its own coverage neighbours fails, not whenever any
+# verified test fails.
+PER_HEAVY = os.environ.get("BR_PER_HEAVY", "0") == "1"
+STRICT_UNIQUE = 0.005
+STRICT_LINE_RATE = 100.0
 PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
+# Changes inside functions: probe-drop only when the static selection would cost at
+# least this many simulated seconds (big selections, where the gain is large).
+PROBE_DROP_RT_MIN = float(os.environ.get("BR_PROBE_DROP_RT_MIN", "0"))
+PROBE_DROP_RT_N = int(os.environ.get("BR_PROBE_DROP_RT_N", "40"))
 MIN_LINE_RATE = float(os.environ.get("BR_MIN_LINE_RATE", "100"))  # sqlglot lines per traced second
 
 
@@ -100,6 +110,7 @@ class Plan:
         self.fail_prior = FAIL_PRIOR
         self.dominated = set()
         self.conditional = set()
+        self.cond_near = {}  # gated heavy test -> its own neighbours being run
         self.stop_on_fail = False
         self.check_imports = False
         self.keyref = []  # key-level refinements, each with its unrefined fallback
@@ -176,6 +187,8 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
 
     an = analysis.Analyzer(maps, REPO)
     num2idx = {n: i for i, n in enumerate(idx2num) if n >= 0}
+    _NEAR.update(near=maps.get("near") or {}, idx2num=idx2num, num2idx=num2idx)
+    probe_eligible(maps)
     idx_sec = [sec.get(n, 0.0) if n >= 0 else 0.0 for n in idx2num]
     cheap_all = 0
     for i, n in enumerate(idx2num):
@@ -220,7 +233,10 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                     # (key-level selections are exact: one specific test may be the
                     # only one to fail, and no handful of probes would see it)
                     focus = focus_tests(an, maps, idx2num) if not an.trace.get("import") else {}
-                    probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus)
+                    if an.trace.get("import"):
+                        probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
+                    elif pack(plan.static, dur_ms)[0] / 1000.0 >= PROBE_DROP_RT_MIN:
+                        probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus, limit=PROBE_DROP_RT_N)
             # Changed code that runs at import time can break the import of every
             # user; such patches always get an import check, even when nothing is run.
             if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
@@ -253,7 +269,12 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             if job is None or not job.done or job.crashed or job.collect_failed or job.import_failed:
                 live = True
             if p.conditional and live:
-                nums |= p.conditional
+                ok = PER_HEAVY and job is not None and job.done and not job.crashed
+                ok = ok and not job.collect_failed and not job.import_failed
+                for h in p.conditional:
+                    nb = p.cond_near.get(h) if ok else None
+                    if not nb or not is_strict(h) or any(num2id[x] not in passed for x in nb):
+                        nums.add(h)
         elif p.conditional:
             nums |= p.conditional
         if p.job is not None and not p.run and not p.job.done:
@@ -312,6 +333,7 @@ def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
 
 
 _ELIGIBLE = None
+_STRICT = 0
 
 
 def probe_eligible(maps):
@@ -322,7 +344,7 @@ def probe_eligible(maps):
     sqlglot line they run is also run by some other test (UNIQUE_MAX): a heavy test
     with its own private code paths (e.g. one that types every SQL function) can fail
     on a changed table entry that no cheap test exercises."""
-    global _ELIGIBLE
+    global _ELIGIBLE, _STRICT
     if _ELIGIBLE is None and os.environ.get("BR_PROBE_ALL") == "1":  # dev: measure risk
         _ELIGIBLE = (1 << len(maps["tests"])) - 1
     if _ELIGIBLE is None:
@@ -334,6 +356,7 @@ def probe_eligible(maps):
         for sid in set((maps["lines"].get("sqlglot/parser.py") or {}).values()):
             content |= maps["sets"][sid]
         eligible = ((1 << n) - 1) & ~content
+        strict = eligible
         if UNIQUE_MAX > 0:
             slow = [i for i, d in enumerate(maps["dur"]) if d >= HEAVY_SEC and content >> i & 1]
             uses = {}
@@ -350,7 +373,10 @@ def probe_eligible(maps):
                 # on changes to cost or limits that small inputs never reveal.
                 if total and own <= UNIQUE_MAX * total and total >= MIN_LINE_RATE * maps["dur"][h]:
                     eligible |= bit
+                if total and own <= STRICT_UNIQUE * total and total >= STRICT_LINE_RATE * maps["dur"][h]:
+                    strict |= bit
         _ELIGIBLE = eligible
+        _STRICT = strict
     return _ELIGIBLE
 
 
@@ -378,17 +404,27 @@ def focus_tests(an, maps, idx2num):
     return counts
 
 
-def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None):
+def probe_drop(plan, maps, num2idx, num2id, verifiable, sec, focus=None, limit=None):
     """Every statically selected test becomes conditional on a few diverse cheap
     probes (the cheapest verifiable test of each file): selected only when the
     verification run finds the change live."""
     if not plan.static:
         return
     pool = [n for n in plan.static if sec[n] < HEAVY_SEC and n in num2idx and maps["tests"][num2idx[n]] in verifiable]
-    first = {}
+    # Round robin over test files: the cheapest test of every file, then the second
+    # cheapest of every file, ... (big files such as the optimizer's get several).
+    per_file = {}
     for n in sorted(pool, key=lambda n: (sec[n], n)):
-        first.setdefault(num2id[n].split("::", 1)[0], n)
-    probes = set(sorted(first.values(), key=lambda n: (sec[n], n))[:PROBE_DROP_N])
+        per_file.setdefault(num2id[n].split("::", 1)[0], []).append(n)
+    order = []
+    depth = 0
+    while len(order) < len(pool):
+        layer = [ts[depth] for ts in per_file.values() if depth < len(ts)]
+        if not layer:
+            break
+        order.extend(sorted(layer, key=lambda n: (sec[n], n)))
+        depth += 1
+    probes = set(order[: limit or PROBE_DROP_N])
     if focus:
         ranked = sorted((n for n in pool if n in focus), key=lambda n: (-focus[n], sec[n], n))
         probes |= set(ranked[:FOCUS_PROBES])
@@ -430,6 +466,7 @@ def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
         if len(picks) >= MIN_PROBES:
             probes.update(picks)
             gated.add(h)
+            plan.cond_near[h] = set(picks)
     if not gated:
         return
     # Diversity: the cheapest verifiable candidate of every test file, so a change
@@ -448,6 +485,30 @@ def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
         plan.stop_on_fail = True
     plan.run |= probes
     plan.notes.append(f"probes({len(gated)}:{len(probes)})")
+
+
+_NEAR = {"num2idx": {}}
+
+
+def is_strict(n):
+    """Heavy test (number) meeting the strict probe criteria."""
+    i = _NEAR["num2idx"].get(n)
+    return i is not None and (_STRICT >> i) & 1 == 1
+
+
+def neighbours(h, pool):
+    """The closest cheap coverage neighbours of heavy test h (numbers) within pool."""
+    near, idx2num, num2idx = _NEAR.get("near") or {}, _NEAR.get("idx2num"), _NEAR.get("num2idx")
+    if idx2num is None:
+        return set()
+    out = []
+    for i in near.get(num2idx.get(h, -1), ()):
+        x = idx2num[i]
+        if x in pool:
+            out.append(x)
+            if len(out) >= PROBES_PER_HEAVY:
+                break
+    return set(out) if len(out) >= MIN_PROBES else set()
 
 
 def order_for_run(nodeids, early_exit):
@@ -589,6 +650,7 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
                 plan.run = set(run_all)
                 plan.conditional = dom
                 plan.stop_on_fail = True
+                plan.cond_near = {h: neighbours(h, set(run_all)) for h in dom}
                 plan.static = rest
                 plan.notes.append(f"dominance({len(dom)})")
     plan.notes.append(f"est={best_cost:.2f}s")
@@ -614,6 +676,11 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     for p in plans:
         root = os.path.join(WORK, p.commit)
         nodeids = order_for_run([num2id[n] for n in p.run], p.stop_on_fail or bool(p.conditional))
+        if PER_HEAVY and p.cond_near:
+            # The gated heavy tests' own neighbours first: once they pass, a later
+            # failure (which stops the run) no longer drags those heavy tests in.
+            first = {num2id[x] for nb in p.cond_near.values() for x in nb}
+            nodeids = [x for x in nodeids if x in first] + [x for x in nodeids if x not in first]
         tcpu = CALIB.get("test_cpu", {})
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
