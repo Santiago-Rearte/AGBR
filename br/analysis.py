@@ -741,7 +741,9 @@ class Analyzer:
                 continue
             kc = self.static_key(k)
             if kc is None:
-                return None
+                # A key known only at run time (a name): fine while its entry is
+                # untouched; an edit to it gives up (see key_refine).
+                kc = frozenset({"?" + ast.dump(k)})
             final[kc] = v
         return spreads, final
 
@@ -806,6 +808,8 @@ class Analyzer:
             a, b = old_d[1].get(kc), new_d[1].get(kc)
             if a is None or b is None or not ast_equal(a, b):
                 changed |= kc
+        if any(x.startswith("?") for x in changed):
+            return None
         kd = self.keydata()
         base = kd.get("state") or {}
         tracked = kd.get("tracked") or {}
@@ -825,7 +829,9 @@ class Analyzer:
             # Dicts that can hold the edited entries: the class's own, its subclasses'
             # (inherited or merged copies), and any other dict whose entry for an
             # edited key is identical to this one's (a copy made elsewhere).
-            if k == own or k[: -len(suffix)] in fam or any(
+            # (A subclass defining its own unrelated dict is not one: if it changed
+            # anyway, the run-time state check sees it and falls back.)
+            if k == own or (k[: -len(suffix)] in fam and set(own_base) <= set(base[k])) or any(
                 x in own_base and base[k].get(x) == own_base[x] for x in changed
             ):
                 if not tracked.get(k):

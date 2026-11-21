@@ -45,7 +45,11 @@ def main():
         tries += 1
         rel, ln, label, patch, new_text = mutants.mutate(rng, files)
         bits, notes, static = an.analyze(patchlib.parse(patch))
-        if static or not an.trace.get("import") or an.trace.get("nonsite"):
+        if os.environ.get("BR_PROBE_RUNTIME") == "1":
+            # dev: changes inside functions only (line-covered sites)
+            if static or an.trace.get("other") or not an.trace.get("runtime"):
+                continue
+        elif static or not an.trace.get("import") or an.trace.get("nonsite"):
             continue
         stats["mutants"] += 1
         cands = set(analysis.iter_bits(bits))
