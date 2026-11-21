@@ -3,3 +3,4 @@
 blast-radius-sample
 output*.jsonl
 **/__pycache__
+.out

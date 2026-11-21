@@ -34,12 +34,14 @@ DATA_FAIL_PRIOR = float(os.environ.get("BR_DATA_FAIL_PRIOR", "0.95"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 CALIB = {}
+LAZY_ALL = {}
 HEAVY_SEC = float(os.environ.get("BR_HEAVY_SEC", "1.5"))
 MIN_CHEAP_COVER = int(os.environ.get("BR_MIN_CHEAP_COVER", "3"))
 DOMINANCE = os.environ.get("BR_DOMINANCE", "1") == "1"
 DOMINANCE_IMPORT = os.environ.get("BR_DOMINANCE_IMPORT", "0") == "1"
 MIN_CHEAP_IMPORT = int(os.environ.get("BR_MIN_CHEAP_IMPORT", "10"))
-PROBES = os.environ.get("BR_PROBES", "0") == "1"
+PROBES = os.environ.get("BR_PROBES", "1") == "1"
+DIVERSE_PROBES = int(os.environ.get("BR_DIVERSE_PROBES", "15"))
 PROBES_PER_HEAVY = int(os.environ.get("BR_PROBES_PER_HEAVY", "6"))
 MIN_PROBES = int(os.environ.get("BR_MIN_PROBES", "3"))
 
@@ -137,6 +139,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
 
     with open(os.path.join(MAPS, "maps.pkl"), "rb") as fh:
         maps = pickle.load(fh)
+    LAZY_ALL.update(maps.get("lazy_all") or {})
     verifiable = set()
     try:
         with open(os.path.join(MAPS, "verifiable.json")) as fh:
@@ -278,6 +281,26 @@ def dominated_heavy(an, cand_bits, idx_sec, cheap_all):
     return skippable
 
 
+_ELIGIBLE = None
+
+
+def probe_eligible(maps):
+    """Heavy tests whose outcome does not depend on SQL content: they read no fixture
+    files and never run the parser (e.g. a generator memory check).  Content-driven
+    heavy tests can fail on one changed table entry that no cheap test exercises, so
+    they are never gated by probes."""
+    global _ELIGIBLE
+    if _ELIGIBLE is None:
+        content = 0
+        for rel, b in maps["reads"].items():
+            if rel.startswith("tests/fixtures/"):
+                content |= b
+        for sid in set((maps["lines"].get("sqlglot/parser.py") or {}).values()):
+            content |= maps["sets"][sid]
+        _ELIGIBLE = ((1 << len(maps["tests"])) - 1) & ~content
+    return _ELIGIBLE
+
+
 def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
     """Measured-risk rule for class- and module-level changes.
 
@@ -285,7 +308,12 @@ def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
     neighbours (also candidates) fails.  The neighbours are run as probes (stop at
     the first failure); every other cheap candidate keeps its usual treatment."""
     near = maps.get("near") or {}
-    heavy = [n for n in plan.static if n in cands and sec[n] >= HEAVY_SEC and n not in plan.conditional]
+    eligible = probe_eligible(maps)
+    heavy = [
+        n
+        for n in plan.static
+        if n in cands and sec[n] >= HEAVY_SEC and n not in plan.conditional and eligible >> num2idx.get(n, 0) & 1
+    ]
     if not heavy:
         return
     probes, gated = set(), set()
@@ -302,12 +330,39 @@ def add_probes(plan, cands, maps, idx2num, num2idx, num2id, verifiable, sec):
             gated.add(h)
     if not gated:
         return
+    # Diversity: the cheapest verifiable candidate of every test file, so a change
+    # that breaks one specific dialect or component is probed by its own tests.
+    cheapest = {}
+    for n in cands:
+        if n in gated or sec[n] >= HEAVY_SEC or maps["tests"][num2idx.get(n, 0)] not in verifiable:
+            continue
+        f = num2id[n].split("::", 1)[0]
+        if f not in cheapest or (sec[n], n) < (sec[cheapest[f]], cheapest[f]):
+            cheapest[f] = n
+    probes.update(sorted(cheapest.values(), key=lambda n: (sec[n], n))[:DIVERSE_PROBES])
     plan.conditional |= gated
     plan.static -= gated | probes
     if not plan.run:
         plan.stop_on_fail = True
     plan.run |= probes
     plan.notes.append(f"probes({len(gated)}:{len(probes)})")
+
+
+def order_for_run(nodeids, early_exit):
+    """Test order inside a verification job.  Tests stay grouped by class (so class
+    fixtures run once); with early exit the cheapest classes, and the cheapest tests
+    in them, go first so a live change is caught after as little CPU as possible."""
+    if not early_exit:
+        return sorted(nodeids)
+    tcpu = CALIB.get("test_cpu", {})
+    scpu = CALIB.get("setup_cpu", {})
+    groups = {}
+    for nid in nodeids:
+        groups.setdefault(nid.rsplit("::", 1)[0], []).append(nid)
+    out = []
+    for cls in sorted(groups, key=lambda c: (scpu.get(c, 0.0) + min(tcpu.get(n, 0.0) for n in groups[c]), c)):
+        out.extend(sorted(groups[cls], key=lambda n: (tcpu.get(n, 0.0), n)))
+    return out
 
 
 def prepare_overlay(plan, fps, an, patchlib):
@@ -456,7 +511,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     jobs = []
     for p in plans:
         root = os.path.join(WORK, p.commit)
-        nodeids = sorted((num2id[n] for n in p.run), key=lambda i: i)
+        nodeids = order_for_run([num2id[n] for n in p.run], p.stop_on_fail or bool(p.conditional))
         tcpu = CALIB.get("test_cpu", {})
         timeouts = {
             num2id[n]: max(3.0, 6.0 * sec[n] + 2.0, 4.0 * tcpu.get(num2id[n], 0.0) + 2.0) for n in p.run
@@ -467,6 +522,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "nodeids": nodeids,
             "timeouts": timeouts,
             "import_check": p.modules,
+            "lazy_all": LAZY_ALL,
             # Once a cheap test fails the dominated heavy tests are selected anyway.
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
         }

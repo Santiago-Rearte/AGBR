@@ -462,17 +462,59 @@ class Analyzer:
                         return ("ins", n, i[1])
         return None
 
+    def family_bits_excluding(self, key, names):
+        """Users of a class family, leaving out subclasses (and their descendants)
+        that redefine every one of names without mentioning them: attribute lookup on
+        those classes never reaches the changed definition."""
+        fam = self.m["family"].get(key, [key])
+        if not names or len(fam) > 400:
+            return self.family_bits(key), fam
+        excluded = set()
+        for sub in fam:
+            if sub == key or sub in excluded:
+                continue
+            smod, _, squal = sub.partition(":")
+            srel = self.m["mod_files"].get(smod)
+            node = self._find_class(srel, squal) if srel else None
+            if node is None:
+                continue
+            redefined = set()
+            for st in node.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                    bound = bound_names(st) & names
+                    if not bound:
+                        continue
+                    mentions = any(
+                        (isinstance(x, ast.Name) and x.id in names)
+                        or (isinstance(x, ast.Attribute) and x.attr in names)
+                        or (isinstance(x, ast.Constant) and x.value in names)
+                        for x in ast.walk(st.value)
+                    )
+                    if not mentions:
+                        redefined |= bound
+            if redefined >= names:
+                excluded.update(self.m["family"].get(sub, [sub]))
+        kept = [k for k in fam if k not in excluded]
+        inst = self.m["inst"]
+        bits = 0
+        for k in kept:
+            bits |= inst.get(k, 0) | self._test_class_bits(k)
+        return bits, kept
+
     def class_level(self, rel, chain, stmt, depth, header=False):
         cls = chain[-1]
         mod = modname(rel) or ""
         qual = ".".join(c.name for c in chain)
         key = f"{mod}:{qual}"
-        users = self.family_bits(key) | self.func_lines_bits(rel, cls)
+        attr_names = set()
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            attr_names = {n for n in bound_names(stmt) if n != "_"}
+        fam_bits, fam = self.family_bits_excluding(key, attr_names)
+        users = fam_bits | self.func_lines_bits(rel, cls)
         # A class is often used through the classes that hold it (a dialect's
         # tokenizer_class, parser_class...) without ever being instantiated.
         users |= self.holder_bits(rel, chain)
         # Subclasses defined elsewhere may use the attribute without being instantiated.
-        fam = self.m["family"].get(key, [])
         if len(fam) <= 40:
             for sub in fam:
                 smod, _, squal = sub.partition(":")

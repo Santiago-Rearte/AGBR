@@ -130,6 +130,16 @@ def main():
         cands = {tests[i] for i in analysis.iter_bits(bits)}
         root = f"/tmp/mut{k}"
         runner.make_overlay(root, REPO, {rel: new_text})
+        # Same mandatory import check as the selector: a failing import selects all.
+        import_failed = False
+        if an.trace.get("import") or an.trace.get("import_mods"):
+            mods = sorted({analysis.modname(rel)} | set(an.trace.get("import_mods", ())))
+            mods = [m for m in mods if m and m.startswith("sqlglot")]
+            chk = runner.Job("chk", {"root": root, "nodeids": [], "import_check": mods, "lazy_all": maps.get("lazy_all", {})}, 120)
+            runner.run_jobs([chk], parallel=1)
+            if chk.import_failed or not chk.done:
+                import_failed = True
+                cands = set(tests)
         t0 = time.monotonic()
         failing = ground_truth(root) - base_fail
         missing = sorted(failing - cands)
@@ -143,6 +153,7 @@ def main():
             "missing": missing[:10],
             "n_missing": len(missing),
             "notes": notes,
+            "import_failed": import_failed,
             "secs": round(time.monotonic() - t0, 1),
         }
         summary.append(rec)

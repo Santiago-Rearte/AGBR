@@ -166,6 +166,15 @@ def main(raw_dir, out_dir):
         mod_classes[key.split(":", 1)[0]].append(key)
     maps["mod_classes"] = dict(mod_classes)
     maps["eager"] = eager_modules()
+    # Modules with lazy attributes (PEP 562 __getattr__): the names they export, so the
+    # run-time import check can exercise every one of them (lazy imports are cached
+    # per process, so coverage only credits the first test that triggers them).
+    maps["lazy_all"] = {
+        name: list(getattr(module, "__all__", ()))
+        for name, module in list(sys.modules.items())
+        if (name == "sqlglot" or name.startswith("sqlglot.")) and "__getattr__" in vars(module)
+    }
+    print(f"  lazy modules: {sorted(maps['lazy_all'])}", file=sys.stderr)
     with open(os.path.join(out_dir, "maps.pkl"), "wb") as fh:
         pickle.dump(maps, fh, protocol=pickle.HIGHEST_PROTOCOL)
     bad = {t: o for t, o in outcomes.items() if o != "passed"}

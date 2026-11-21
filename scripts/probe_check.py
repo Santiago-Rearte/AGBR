@@ -49,7 +49,8 @@ def main():
             continue
         stats["mutants"] += 1
         cands = set(analysis.iter_bits(bits))
-        heavy = [i for i in cands if dur[i] >= selector.HEAVY_SEC * 1000]
+        eligible = selector.probe_eligible(maps)
+        heavy = [i for i in cands if dur[i] >= selector.HEAVY_SEC * 1000 and eligible >> i & 1]
         probes, gated = set(), []
         for h in heavy:
             picks = [i for i in near.get(h, ()) if i in cands and dur[i] < selector.HEAVY_SEC * 1000 and T[i] in verifiable]

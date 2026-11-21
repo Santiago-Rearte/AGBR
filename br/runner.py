@@ -254,6 +254,23 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False):
     unittest.TestSuite(tests).run(Result())
 
 
+def check_lazy_attributes(out, base_all, only):
+    """Resolves every lazy attribute (PEP 562) of loaded sqlglot modules: the names
+    they export now and the ones they exported on the base commit."""
+    for name, module in list(sys.modules.items()):
+        if name not in only or module is None:
+            continue
+        if "__getattr__" not in vars(module) and name not in base_all:
+            continue
+        names = set(getattr(module, "__all__", ()) or ()) | set(base_all.get(name, ()))
+        for attr in sorted(names):
+            try:
+                getattr(module, attr)
+            except BaseException as error:  # noqa: BLE001
+                out.write(f"IMPORTFAIL {name} {type(error).__name__}:{attr}\n")
+                break
+
+
 def child_main(spec, wfd):
     try:
         os.setpgid(0, 0)
@@ -273,6 +290,8 @@ def child_main(spec, wfd):
                 importlib.import_module(mod)
             except BaseException as error:  # noqa: BLE001
                 out.write(f"IMPORTFAIL {mod} {type(error).__name__}\n")
+        if spec.get("import_check"):
+            check_lazy_attributes(out, spec.get("lazy_all", {}), set(spec["import_check"]))
         if spec.get("mode", "unittest") == "unittest":
             run_unittest(
                 spec["nodeids"],
