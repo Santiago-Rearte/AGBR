@@ -619,6 +619,14 @@ def child_main(spec, wfd):
                 spec.get("cont") or (),
                 spec.get("phase2") or (),
             )
+            if spec.get("record_modules"):
+                # Calibration: the library modules the tests needed (preloaded by the
+                # run-time parent so verification children do not import them again).
+                mods = sorted(
+                    m for m in list(sys.modules)
+                    if not m.startswith(("sqlglot", "tests", "__main__", "pytest", "_pytest", "pluggy"))
+                )
+                out.write("MODS " + json.dumps(mods) + "\n")
             out.write("DONE\n")
             out.flush()
             os._exit(0)
@@ -703,6 +711,7 @@ class Job:
         self.list_fp = {}
         self.slice_msgs = []
         self.import_hard = set()  # modules whose import itself failed
+        self.mods = set()
 
 
 def _consume(job, data):
@@ -745,6 +754,11 @@ def _consume(job, data):
             name, _, data = rest2.partition(" ")
             try:
                 job.list_fp.setdefault(ckey, {})[name] = json.loads(data)
+            except ValueError:
+                pass
+        elif tag == "MODS":
+            try:
+                job.mods = set(json.loads(rest))
             except ValueError:
                 pass
         elif tag in ("SLICE", "SLICEFAIL"):
@@ -860,7 +874,8 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         groups[i].extend(ts)
         loads[i] += len(ts)
     jobs = [
-        Job(i, {"root": repo, "nodeids": g, "default_timeout": 600.0, "record_lists": True}, budget=900.0)
+        Job(i, {"root": repo, "nodeids": g, "default_timeout": 600.0, "record_lists": True, "record_modules": True},
+            budget=900.0)
         for i, g in enumerate(groups)
         if g
     ]
@@ -872,11 +887,13 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
         if job.collect_failed or job.crashed or not job.done:
             log(f"  calibration job {job.key}: done={job.done} crash={job.crashed} collect={sorted(job.collect_failed)[:3]}")
     test_cpu, collect_cpu, setup_cpu, list_fp = {}, {}, {}, {}
+    modules = set()
     for job in jobs:
         test_cpu.update(job.test_cpu)
         collect_cpu.update(job.collect_cpu)
         setup_cpu.update(job.setup_cpu)
         list_fp.update(job.list_fp)
+        modules |= job.mods
     # Fixed cost of one verification job: fork, pytest start-up, an empty session.
     first = sorted(tests_list)[0]
     probe = [Job(f"probe{i}", {"root": repo, "nodeids": [first], "default_timeout": 60.0}, 120.0) for i in range(3)]
@@ -891,7 +908,7 @@ def calibrate(repo, tests_list, out_path, parallel=4, chunks=24):
     with open(out_path, "w") as fh:
         json.dump(
             {"passed": sorted(passed), "test_cpu": test_cpu, "collect_cpu": collect_cpu, "setup_cpu": setup_cpu,
-             "job_overhead": overheads[1], "list_fp": list_fp},
+             "job_overhead": overheads[1], "list_fp": list_fp, "modules": sorted(modules)},
             fh,
         )
     log(f"job overhead {overheads}, collect total {sum(collect_cpu.values()):.2f}s, test cpu total {sum(test_cpu.values()):.2f}s")

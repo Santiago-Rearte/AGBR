@@ -56,10 +56,12 @@ PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU s
 LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
 IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
+WARM_STDLIB = os.environ.get("BR_WARM_STDLIB", "1") == "1"
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
 RT_DROP_RUN = os.environ.get("BR_RT_DROP_RUN", "0") == "1"
+IMPORT_DROP_RUN = os.environ.get("BR_IMPORT_DROP_RUN", "0") == "1"
 RT_DROP_MIN_RUN = int(os.environ.get("BR_RT_DROP_MIN_RUN", "20"))
 KEEP_RATIO = float(os.environ.get("BR_KEEP_RATIO", "2.0"))  # neighbours run when cheaper than this x heavy
 LIVE_REST_MAX = float(os.environ.get("BR_LIVE_REST_MAX", "15.0"))  # CPU seconds (calibrated)
@@ -293,6 +295,13 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                     # only one to fail, and no handful of probes would see it)
                     focus = focus_tests(an, maps, idx2num) if not an.trace.get("import") else {}
                     if an.trace.get("import"):
+                        if IMPORT_DROP_RUN and not plan.mixed:
+                            # High-variance rule: the cheap tests the cost model chose to
+                            # verify are left to the probes too (run only once found live).
+                            neighbours_run = set().union(*plan.cond_near.values()) if plan.cond_near else set()
+                            light = {n for n in plan.run if sec[n] < HEAVY_SEC} - neighbours_run
+                            plan.static |= light
+                            plan.run -= light
                         probe_drop(plan, maps, num2idx, num2id, verifiable, sec)
                     elif RT_DROP_RUN and len(plan.run) > RT_DROP_MIN_RUN:
                         # High-variance rule: a change inside functions is verified on
@@ -829,9 +838,20 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             f = num2id[n].split("::", 1)[0]
             need[f] = need.get(f, 0) + 1
     extra = third_party_imports(an, [f for f, k in need.items()], plans)
+    if WARM_STDLIB:
+        # The library modules the tests used at calibration: the standard library
+        # ones, and the submodules of the third-party packages about to be used
+        # (pandas.testing...), imported once here instead of in every child.
+        std = set(getattr(sys, "stdlib_module_names", ()))
+        skip = ("test", "idlelib", "tkinter", "turtle", "antigravity", "this", "__phello__", "lib2to3")
+        tops = set(extra)
+        for m in CALIB.get("modules") or ():
+            top = m.split(".", 1)[0]
+            if (top in std and not top.startswith(skip)) or top in tops:
+                extra.append(m)
     t0 = cpu_seconds()
     runner.warm_imports(extra)
-    log(f"warm imports {sorted(extra)}: {cpu_seconds() - t0:.2f}s cpu")
+    log(f"warm imports {len(extra)} modules: {cpu_seconds() - t0:.2f}s cpu")
 
     jobs = []
     for p in plans:
