@@ -388,6 +388,12 @@ def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, ke
         import gc
 
         gc.freeze()
+    if GC_THRESHOLD > 0:
+        import gc
+
+        # Young collections less often (expression trees are allocated by the million;
+        # most of them die young anyway).  Tests calling gc.collect() are unaffected.
+        gc.set_threshold(GC_THRESHOLD, 50, 50)
     phase2 = set(phase2)
     first = Result()
     unittest.TestSuite([t for t in tests if by_id.get(t.id()) not in phase2]).run(first)
@@ -453,6 +459,7 @@ def check_lazy_attributes(out, base_all, only):
 
 
 LAZY_POOLS = os.environ.get("BR_LAZY_POOLS", "1") == "1"
+GC_THRESHOLD = int(os.environ.get("BR_GC_THRESHOLD", "0"))
 SUBTEST_ABORT = os.environ.get("BR_SUBTEST_ABORT", "1") == "1"
 
 
