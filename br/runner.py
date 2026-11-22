@@ -683,13 +683,14 @@ def prepare_warm(repo):
         sys.path.insert(0, repo)
     import sqlglot
 
-    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-        if info.name == "sqlglot.__main__" or info.name in sys.modules:
-            continue
-        try:
-            importlib.import_module(info.name)
-        except Exception:
-            pass
+    if os.environ.get("BR_WARM_ALL", "1") == "1":
+        for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+            if info.name == "sqlglot.__main__" or info.name in sys.modules:
+                continue
+            try:
+                importlib.import_module(info.name)
+            except Exception:
+                pass
     prefix = os.path.join(repo, "sqlglot") + os.sep
     index = {}
     for obj in gc.get_objects():

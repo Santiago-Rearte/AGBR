@@ -1222,7 +1222,7 @@ class Analyzer:
         old_tree = self.tree(path)
         if ast_equal(old_tree, new_tree):
             return self.reads(path), "noop", False
-        if EQUIV_IS and self._is_eq_equivalent(old_tree, new_tree):
+        if EQUIV_IS and self._is_eq_equivalent(old_tree, new_tree, old, new):
             return self.reads(path), "equiv", False
         sites = ast_diff(old_tree, new_tree)
         bits = 0
@@ -1234,12 +1234,29 @@ class Analyzer:
             self._new_tree = None
         return bits, f"sites={len(sites)}", False
 
-    def _is_eq_equivalent(self, old_tree, new_tree):
+    def _is_eq_equivalent(self, old_tree, new_tree, old_src=None, new_src=None):
         """The only change turns `a is b` into `a == b` where one side is a singleton:
         None/True/False or a member of an Enum class defined in sqlglot (equality of
         such objects is identity)."""
+        line = None
+        if old_src is not None and new_src is not None:
+            # Cheap text check first: one changed line, one ` is ` became ` == `.
+            a, b = old_src.split(b"\n"), new_src.split(b"\n")
+            if len(a) != len(b):
+                return False
+            diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+            if len(diff) != 1:
+                return False
+            x, y = a[diff[0]], b[diff[0]]
+            if not any(
+                x[: m.start()] + b" == " + x[m.end():] == y for m in re.finditer(rb" is (?!not )", x)
+            ):
+                return False
+            line = diff[0] + 1
         for node in ast.walk(new_tree):
             if not isinstance(node, ast.Compare):
+                continue
+            if line is not None and not (node.lineno <= line <= getattr(node, "end_lineno", node.lineno)):
                 continue
             for k, op in enumerate(node.ops):
                 if not isinstance(op, ast.Eq):

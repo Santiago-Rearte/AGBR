@@ -1037,25 +1037,22 @@ def core_only_heavy(an, failed, hard, idx2num, sec):
 
 
 def third_party_imports(an, test_files, plans):
-    """Third-party modules imported at the top of the test files about to run."""
-    import ast
-
+    """Third-party modules imported at the top of the test files about to run (the
+    unindented import lines: the module body's own imports, without parsing it)."""
     std = set(getattr(sys, "stdlib_module_names", ()))
     mods = set()
+    pat = re.compile(r"^(?:import\s+([\w.]+(?:\s*,\s*[\w.]+)*)|from\s+(\w[\w.]*)\s+import\b)", re.M)
     for f in test_files:
         try:
-            tree = an.tree(f)
+            text = an.source(f).decode("utf-8", "replace")
         except Exception:
             continue
-        for node in tree.body:
-            names = []
-            if isinstance(node, ast.Import):
-                names = [a.name.split(".")[0] for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-                names = [node.module.split(".")[0]]
-            for m in names:
-                if m not in std and m not in ("sqlglot", "tests"):
-                    mods.add(m)
+        for m in pat.finditer(text):
+            names = [x.split(" as ")[0].strip() for x in m.group(1).split(",")] if m.group(1) else [m.group(2)]
+            for name in names:
+                top = name.split(".")[0]
+                if top and top not in std and top not in ("sqlglot", "tests"):
+                    mods.add(top)
     return sorted(mods)
 
 
