@@ -72,6 +72,7 @@ PROBE_DROP_KEYS = os.environ.get("BR_PROBE_DROP_KEYS", "0") == "1"  # also key-l
 # verified test fails.
 PER_HEAVY = os.environ.get("BR_PER_HEAVY", "0") == "1"
 PER_HEAVY_ALL = os.environ.get("BR_PER_HEAVY_ALL", "0") == "1"  # every eligible heavy test
+PER_HEAVY_MIN_SEC = float(os.environ.get("BR_PER_HEAVY_MIN_SEC", "0"))  # neighbour rule only from this weight
 STRICT_UNIQUE = 0.005
 STRICT_LINE_RATE = 100.0
 PROBE_DROP_N = int(os.environ.get("BR_PROBE_DROP_N", "25"))
@@ -218,7 +219,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
 
     an = analysis.Analyzer(maps, REPO)
     num2idx = {n: i for i, n in enumerate(idx2num) if n >= 0}
-    _NEAR.update(near=maps.get("near") or {}, idx2num=idx2num, num2idx=num2idx)
+    _NEAR.update(near=maps.get("near") or {}, idx2num=idx2num, num2idx=num2idx, sec=sec)
     probe_eligible(maps)
     idx_sec = [sec.get(n, 0.0) if n >= 0 else 0.0 for n in idx2num]
     cheap_all = 0
@@ -597,6 +598,8 @@ _NEAR = {"num2idx": {}}
 def is_strict(n):
     """Heavy test (number) meeting the strict probe criteria."""
     i = _NEAR["num2idx"].get(n)
+    if (_NEAR.get("sec") or {}).get(n, 0.0) < PER_HEAVY_MIN_SEC:
+        return False  # (mid-weight tests stay selected once the change is live)
     if i is not None and PER_HEAVY_ALL:
         return (_ELIGIBLE or 0) >> i & 1 == 1
     return i is not None and (_STRICT >> i) & 1 == 1
