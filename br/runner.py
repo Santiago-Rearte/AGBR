@@ -581,6 +581,15 @@ def child_main(spec, wfd):
         root = spec["root"]
         os.chdir(root)
         sys.path.insert(0, root)
+        if WARM is not None:
+            # sqlglot was preloaded by the parent: keep it only for a change inside
+            # functions, patched in place; anything else gets a fresh import.
+            hot = spec.get("hot")
+            if hot is not None and hot_patch(hot):
+                redirect_packages(root)
+                out.write("HOT\n")
+            else:
+                evict_sqlglot()
         if spec.get("inline_pools", True):
             install_inline_pools()
         if spec.get("import_check"):
@@ -657,6 +666,135 @@ def child_main(spec, wfd):
 
 # ---------------------------------------------------------------------------
 # Parent side.
+
+
+WARM = None  # (repo, function index) once sqlglot is preloaded in this process
+
+
+def prepare_warm(repo):
+    """Imports every sqlglot module of the base checkout (once, before forking) and
+    indexes its functions by (file, qualified name, first line)."""
+    global WARM
+    import gc
+    import pkgutil
+    import types
+
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name == "sqlglot.__main__" or info.name in sys.modules:
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            pass
+    prefix = os.path.join(repo, "sqlglot") + os.sep
+    index = {}
+    for obj in gc.get_objects():
+        if type(obj) is types.FunctionType:
+            c = obj.__code__
+            if c.co_filename.startswith(prefix):
+                index.setdefault((c.co_filename, c.co_qualname, c.co_firstlineno), []).append(obj)
+    WARM = (repo, index)
+    sys.path.remove(repo)
+
+
+def _code_tree(code):
+    """(qualname, firstlineno) -> code for code and every code object nested in it,
+    plus child key -> parent key; None when two share a key."""
+    import types
+
+    out, parent = {}, {}
+    stack = [(code, None)]
+    while stack:
+        c, p = stack.pop()
+        key = (c.co_qualname, c.co_firstlineno)
+        if key in out:
+            return None, None
+        out[key] = c
+        parent[key] = p
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                stack.append((k, key))
+    return out, parent
+
+
+def _code_sig(c):
+    import types
+
+    consts = tuple(("<code>", k.co_qualname, k.co_firstlineno) if isinstance(k, types.CodeType) else (type(k).__name__, repr(k))
+                   for k in c.co_consts)
+    return (c.co_code, consts, c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars, c.co_flags,
+            c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount)
+
+
+def hot_patch(hot):
+    """Applies a change inside functions to the preloaded sqlglot by swapping the code
+    of the changed functions.  False (nothing usable) when it cannot be done exactly."""
+    repo, index = WARM
+    patched = []
+    try:
+        for rel, src in hot.items():
+            name = rel[:-3].replace("/", ".")
+            if name.endswith(".__init__"):
+                name = name[: -len(".__init__")]
+            module = sys.modules.get(name)
+            if module is None:
+                continue  # loaded later, from the overlay
+            filename = module.__file__
+            with open(filename, encoding="utf-8") as fh:
+                base_src = fh.read()
+            if base_src.count("\n") != src.count("\n"):
+                return False
+            old, _ = _code_tree(compile(base_src, filename, "exec"))
+            new, parent = _code_tree(compile(src, filename, "exec"))
+            if old is None or new is None or set(old) != set(new):
+                return False
+            direct = {k for k in new if _code_sig(new[k]) != _code_sig(old[k])}
+
+            def is_function(c):
+                return c.co_flags & 0x3 == 0x3  # CO_OPTIMIZED | CO_NEWLOCALS
+
+            changed = set()
+            for key in direct:
+                if not is_function(new[key]):
+                    return False  # module or class body: runs at import time
+                # The enclosing functions hold the nested code in their constants:
+                # they are swapped too, so later calls create the new version.
+                k = key
+                while k is not None and is_function(new[k]):
+                    changed.add(k)
+                    k = parent[k]
+            for key in changed:
+                funcs = index.get((filename, key[0], key[1]), [])
+                if not funcs and parent[key] not in changed:
+                    return False
+                for f in funcs:
+                    if f.__code__.co_freevars != new[key].co_freevars:
+                        return False
+                    patched.append(f)
+                    f.__code__ = new[key]
+        return True
+    except Exception:
+        return False
+
+
+def redirect_packages(root):
+    """Modules not preloaded load from the overlay tree."""
+    for name, module in list(sys.modules.items()):
+        if (name == "sqlglot" or name.startswith("sqlglot.")) and getattr(module, "__path__", None) is not None:
+            try:
+                module.__path__ = [os.path.join(root, *name.split("."))]
+            except Exception:
+                pass
+
+
+def evict_sqlglot():
+    for name in list(sys.modules):
+        if name == "sqlglot" or name.startswith("sqlglot."):
+            del sys.modules[name]
 
 
 def warm_imports(extra_modules=(), with_pytest=False):

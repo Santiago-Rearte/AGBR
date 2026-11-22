@@ -57,6 +57,7 @@ LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
 IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
 WARM_STDLIB = os.environ.get("BR_WARM_STDLIB", "1") == "1"
+WARM_SQLGLOT = os.environ.get("BR_WARM_SQLGLOT", "1") == "1"  # preload + patch functions in place
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
@@ -143,6 +144,7 @@ class Plan:
         self.mixed = False  # data and code changes together
         self.cont = set()  # run tests still run after the first failure stops the pass
         self.phase2 = set()  # conditional tests verified only once the change is live
+        self.hot = None  # rel -> patched source, for a change inside functions only
 
 
 def main():
@@ -321,6 +323,21 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
                 plan.run |= set(plan.sliced)
                 plan.static -= set(plan.sliced)
                 plan.notes.append(f"slice({len(plan.sliced)})")
+            if (
+                WARM_SQLGLOT
+                and plan.files
+                and not plan.deleted
+                and an.trace.get("runtime")
+                and not an.trace.get("other")
+                and not an.trace.get("import")
+                and not an.trace.get("import_mods")
+                and not plan.keyref
+                and all(r.startswith("sqlglot/") and r.endswith(".py") for r in plan.files)
+            ):
+                try:
+                    plan.hot = {r: d.decode("utf-8") for r, d in plan.files.items()}
+                except UnicodeDecodeError:
+                    plan.hot = None
             # Changed code that runs at import time can break the import of every
             # user; such patches always get an import check, even when nothing is run.
             if plan.files is not None and (an.trace.get("import") or an.trace.get("import_mods")):
@@ -901,6 +918,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
             "keep": keep,
             "cont": sorted(num2id[n] for n in p.cont & p.run),
+            "hot": p.hot if not p.check_imports else None,
             "phase2": phase2,
         }
         if p.sliced:
@@ -958,6 +976,10 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     # collector does not touch, and copy, the parent's heap.
     import gc
 
+    if WARM_SQLGLOT and any(j.spec.get("hot") for j in jobs):
+        t0 = cpu_seconds()
+        runner.prepare_warm(REPO)
+        log(f"preloaded sqlglot for {sum(1 for j in jobs if j.spec.get('hot'))} jobs: {cpu_seconds() - t0:.2f}s cpu")
     an.release()
     gc.collect()
     gc.freeze()
