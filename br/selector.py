@@ -58,6 +58,8 @@ CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder als
 IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
 WARM_STDLIB = os.environ.get("BR_WARM_STDLIB", "1") == "1"
 WARM_SQLGLOT = os.environ.get("BR_WARM_SQLGLOT", "1") == "1"  # preload + patch functions in place
+PARTIAL_RELOAD = os.environ.get("BR_PARTIAL_RELOAD", "1") == "1"  # re-import only what depends on the patch
+RELOAD_MAX = int(os.environ.get("BR_RELOAD_MAX", "40"))
 LIVE_FRAC = float(os.environ.get("BR_LIVE_FRAC", "0.5"))  # share of the run tests a live change fails (cost model)
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
@@ -920,6 +922,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "keep": keep,
             "cont": sorted(num2id[n] for n in p.cont & p.run),
             "hot": p.hot if not p.check_imports else None,
+            "evict": reload_closure(an, p) if PARTIAL_RELOAD and not (p.hot and not p.check_imports) else None,
             "phase2": phase2,
         }
         if p.sliced:
@@ -977,7 +980,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     # collector does not touch, and copy, the parent's heap.
     import gc
 
-    if WARM_SQLGLOT and any(j.spec.get("hot") for j in jobs):
+    if WARM_SQLGLOT and any(j.spec.get("hot") or j.spec.get("evict") for j in jobs):
         t0 = cpu_seconds()
         runner.prepare_warm(REPO)
         log(f"preloaded sqlglot for {sum(1 for j in jobs if j.spec.get('hot'))} jobs: {cpu_seconds() - t0:.2f}s cpu")
@@ -985,6 +988,34 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     gc.collect()
     gc.freeze()
     runner.run_jobs(jobs, parallel=PARALLEL, setup=setup, cleanup=cleanup)
+
+
+def reload_closure(an, p):
+    """Modules a child must import afresh for patch p: the patched sqlglot modules and,
+    transitively, every sqlglot module importing one of them (None: everything)."""
+    if not WARM_SQLGLOT or not p.files or p.deleted:
+        return None
+    if not all(r.startswith("sqlglot/") and r.endswith(".py") for r in p.files):
+        return None
+    seen, todo = set(), list(p.files)
+    while todo:
+        r = todo.pop()
+        if r in seen:
+            continue
+        seen.add(r)
+        if len(seen) > RELOAD_MAX:
+            return None
+        todo.extend(f for f in an.importer_files(r) if f.startswith("sqlglot/") and f.endswith(".py"))
+    names = sorted({an_modname(r) for r in seen} - {None})
+    if not names or "sqlglot" in names:
+        return None
+    return names
+
+
+def an_modname(rel):
+    import analysis
+
+    return analysis.modname(rel)
 
 
 _CORE_ONLY = {}
