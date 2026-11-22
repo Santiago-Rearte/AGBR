@@ -61,6 +61,8 @@ WARM_SQLGLOT = os.environ.get("BR_WARM_SQLGLOT", "1") == "1"  # preload + patch 
 PARTIAL_RELOAD = os.environ.get("BR_PARTIAL_RELOAD", "1") == "1"  # re-import only what depends on the patch
 RELOAD_MAX = int(os.environ.get("BR_RELOAD_MAX", "40"))
 LIVE_FRAC = float(os.environ.get("BR_LIVE_FRAC", "0.5"))  # share of the run tests a live change fails (cost model)
+STATE_CHECK = os.environ.get("BR_STATE_CHECK", "1") == "1"  # confirm key-level refinements
+ANALYSIS_GC = os.environ.get("BR_ANALYSIS_GC", "1") == "1"
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
@@ -234,6 +236,8 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
         if n >= 0 and idx_sec[i] < HEAVY_SEC and maps["tests"][i] in verifiable:
             cheap_all |= 1 << i
     plans = []
+    if not ANALYSIS_GC:
+        gc.disable()  # (the analysis allocates ASTs by the million; the process is short)
     for c in commits:
         plan = Plan(c)
         plans.append(plan)
@@ -393,7 +397,7 @@ def select(commits, tests, skipped, dur_ms, sec, all_nums):
             nums |= p.conditional
         if p.job is not None and not p.run and not p.job.done:
             nums |= set(all_nums)  # the import check itself did not finish
-        if p.keyref and (p.job is None or p.job.state_ok is not True):
+        if p.keyref and STATE_CHECK and (p.job is None or p.job.state_ok is not True):
             # The import-time state check did not prove the edit confined to the
             # edited dict entries: use the unrefined selection.
             fb = 0
@@ -928,7 +932,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
         if p.sliced:
             spec["slices"] = spec_slices
             spec["stop_on_fail"] = False  # the sliced heavy tests must run
-        if p.keyref:
+        if p.keyref and STATE_CHECK:
             allowed = {}
             for info in p.keyref:
                 for k, v in info["allowed"].items():
@@ -985,6 +989,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
         runner.prepare_warm(REPO)
         log(f"preloaded sqlglot for {sum(1 for j in jobs if j.spec.get('hot'))} jobs: {cpu_seconds() - t0:.2f}s cpu")
     an.release()
+    gc.enable()  # (the children run tests: they need the collector)
     gc.collect()
     gc.freeze()
     runner.run_jobs(jobs, parallel=PARALLEL, setup=setup, cleanup=cleanup)
