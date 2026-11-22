@@ -588,6 +588,8 @@ def child_main(spec, wfd):
             if hot is not None and hot_patch(hot):
                 redirect_packages(root)
                 out.write("HOT\n")
+            elif spec.get("evict") is not None:
+                partial_reload(spec["evict"], root)
             else:
                 evict_sqlglot()
         if spec.get("inline_pools", True):
@@ -790,6 +792,20 @@ def redirect_packages(root):
                 module.__path__ = [os.path.join(root, *name.split("."))]
             except Exception:
                 pass
+
+
+def partial_reload(names, root):
+    """Fresh imports, from the overlay, of the patched modules and of every module
+    importing them (the parent computed that closure); the other preloaded modules
+    are the base ones, identical either way."""
+    redirect_packages(root)
+    for name in names:
+        sys.modules.pop(name, None)
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except BaseException:  # noqa: BLE001 - reported by the import check / tests
+            pass
 
 
 def evict_sqlglot():
