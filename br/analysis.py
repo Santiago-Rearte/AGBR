@@ -22,6 +22,7 @@ KEY_REFINE = os.environ.get("BR_KEY_REFINE", "1") == "1"
 SETUP_REFINE = os.environ.get("BR_SETUP_REFINE", "1") == "1"
 DATA_SITES = os.environ.get("BR_DATA_SITES", "1") == "1"  # see analyze()
 EQUIV_IS = os.environ.get("BR_EQUIV_IS", "1") == "1"  # `is` -> `==` against a singleton
+SYNTAX_COMPILE = os.environ.get("BR_SYNTAX_COMPILE", "0") == "1"
 KEYS_PATH = os.path.join(os.environ.get("BR_MAPS", "/opt/maps"), "keys.pkl")
 
 
@@ -1216,7 +1217,10 @@ class Analyzer:
             return self.broken_module(path), "apply-failed", True
         try:
             new_tree = ast.parse(new)
-            compile(new_tree, path, "exec")
+            if SYNTAX_COMPILE:
+                # (errors only the bytecode compiler finds, e.g. `return` outside a
+                # function, also surface as an import failure when verifying)
+                compile(new_tree, path, "exec")
         except (SyntaxError, ValueError):
             return self.broken_module(path), "syntax", True
         old_tree = self.tree(path)
