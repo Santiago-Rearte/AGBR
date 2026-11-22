@@ -62,6 +62,7 @@ PARTIAL_RELOAD = os.environ.get("BR_PARTIAL_RELOAD", "1") == "1"  # re-import on
 RELOAD_MAX = int(os.environ.get("BR_RELOAD_MAX", "40"))
 LIVE_FRAC = float(os.environ.get("BR_LIVE_FRAC", "0.5"))  # share of the run tests a live change fails (cost model)
 STATE_CHECK = os.environ.get("BR_STATE_CHECK", "1") == "1"  # confirm key-level refinements
+RELATED_FIRST = os.environ.get("BR_RELATED_FIRST", "1") == "1"  # fail-fast run order
 ANALYSIS_GC = os.environ.get("BR_ANALYSIS_GC", "1") == "1"
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
@@ -653,10 +654,12 @@ def neighbours(h, pool):
     return set(out) if len(out) >= MIN_PROBES else set()
 
 
-def order_for_run(nodeids, early_exit):
+def order_for_run(nodeids, early_exit, changed=()):
     """Test order inside a verification job.  Tests stay grouped by class (so class
-    fixtures run once); with early exit the cheapest classes, and the cheapest tests
-    in them, go first so a live change is caught after as little CPU as possible."""
+    fixtures run once); with early exit the classes of test files named after a
+    changed module go first (test_snowflake for dialects/snowflake.py, test_optimizer
+    for optimizer/...: most likely to fail), then the cheapest, so a live change is
+    caught after as little CPU as possible.  (Order only: nothing else changes.)"""
     if not early_exit:
         return sorted(nodeids)
     tcpu = CALIB.get("test_cpu", {})
@@ -664,8 +667,17 @@ def order_for_run(nodeids, early_exit):
     groups = {}
     for nid in nodeids:
         groups.setdefault(nid.rsplit("::", 1)[0], []).append(nid)
+
+    def related(cls):
+        if not RELATED_FIRST:
+            return False
+        stem = cls.split("::", 1)[0].rsplit("/", 1)[-1]
+        stem = stem[: -len(".py")] if stem.endswith(".py") else stem
+        stem = stem[len("test_"):] if stem.startswith("test_") else stem
+        return bool(stem) and any(stem in rel for rel in changed)
+
     out = []
-    for cls in sorted(groups, key=lambda c: (scpu.get(c, 0.0) + min(tcpu.get(n, 0.0) for n in groups[c]), c)):
+    for cls in sorted(groups, key=lambda c: (not related(c), scpu.get(c, 0.0) + min(tcpu.get(n, 0.0) for n in groups[c]), c)):
         out.extend(sorted(groups[cls], key=lambda n: (tcpu.get(n, 0.0), n)))
     return out
 
@@ -880,7 +892,8 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     jobs = []
     for p in plans:
         root = os.path.join(WORK, p.commit)
-        nodeids = order_for_run([num2id[n] for n in p.run], p.stop_on_fail or bool(p.conditional))
+        nodeids = order_for_run([num2id[n] for n in p.run], p.stop_on_fail or bool(p.conditional),
+                                sorted(p.files or ()))
         keep = []
         if PER_HEAVY and p.cond_near:
             # The strict gated heavy tests' own neighbours still run after the first
