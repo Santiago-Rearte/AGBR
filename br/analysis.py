@@ -21,6 +21,7 @@ PYTEST_CONFIG = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"}
 KEY_REFINE = os.environ.get("BR_KEY_REFINE", "1") == "1"
 SETUP_REFINE = os.environ.get("BR_SETUP_REFINE", "1") == "1"
 DATA_SITES = os.environ.get("BR_DATA_SITES", "1") == "1"  # see analyze()
+EQUIV_IS = os.environ.get("BR_EQUIV_IS", "1") == "1"  # `is` -> `==` against a singleton
 KEYS_PATH = os.path.join(os.environ.get("BR_MAPS", "/opt/maps"), "keys.pkl")
 
 
@@ -1169,7 +1170,7 @@ class Analyzer:
                 # they do not stop the code part's sites from being analysed as such.
                 self.trace["other"] = True
                 self.trace["data"] = True
-            elif not (note.startswith("sites=") or note in ("noop", "mode")):
+            elif not (note.startswith("sites=") or note in ("noop", "mode", "equiv")):
                 self.trace["other"] = True
                 self.trace["nonsite"] = True
         return bits, notes, static
@@ -1221,6 +1222,8 @@ class Analyzer:
         old_tree = self.tree(path)
         if ast_equal(old_tree, new_tree):
             return self.reads(path), "noop", False
+        if EQUIV_IS and self._is_eq_equivalent(old_tree, new_tree):
+            return self.reads(path), "equiv", False
         sites = ast_diff(old_tree, new_tree)
         bits = 0
         self._new_tree = new_tree
@@ -1230,6 +1233,58 @@ class Analyzer:
         finally:
             self._new_tree = None
         return bits, f"sites={len(sites)}", False
+
+    def _is_eq_equivalent(self, old_tree, new_tree):
+        """The only change turns `a is b` into `a == b` where one side is a singleton:
+        None/True/False or a member of an Enum class defined in sqlglot (equality of
+        such objects is identity)."""
+        for node in ast.walk(new_tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            for k, op in enumerate(node.ops):
+                if not isinstance(op, ast.Eq):
+                    continue
+                node.ops[k] = ast.Is()
+                try:
+                    same = ast_equal(old_tree, new_tree)
+                finally:
+                    node.ops[k] = op
+                if same:
+                    left = node.left if k == 0 else node.comparators[k - 1]
+                    return self._singleton(left) or self._singleton(node.comparators[k])
+        return False
+
+    def _singleton(self, node):
+        if isinstance(node, ast.Constant):
+            return node.value is None or node.value is True or node.value is False
+        if isinstance(node, ast.Attribute):
+            owner = node.value
+            name = owner.id if isinstance(owner, ast.Name) else owner.attr if isinstance(owner, ast.Attribute) else None
+            return name is not None and name in self._enum_classes()
+        return False
+
+    def _enum_classes(self):
+        key = ("enums",)
+        if key not in self._memo:
+            bases = {}
+            pat = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", re.M)
+            for rel, text in self.corpus().items():
+                if rel.startswith("sqlglot/") and "class " in text:
+                    for m in pat.finditer(text):
+                        bases.setdefault(m.group(1), set()).update(
+                            b.strip().rsplit(".", 1)[-1] for b in m.group(2).split(",") if b.strip()
+                        )
+            enums = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+            changed = True
+            while changed:
+                changed = False
+                for name, bs in bases.items():
+                    if name not in enums and bs & enums:
+                        enums.add(name)
+                        changed = True
+            # (a class name defined twice, once as an enum and once not, is ambiguous)
+            self._memo[key] = {n for n in enums if n in bases and bases[n] & enums}
+        return self._memo[key]
 
     def broken_module(self, rel):
         mod = modname(rel)
