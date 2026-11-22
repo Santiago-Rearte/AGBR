@@ -693,6 +693,7 @@ class Job:
         self.setup_cpu = {}
         self.list_fp = {}
         self.slice_msgs = []
+        self.import_hard = set()  # modules whose import itself failed
 
 
 def _consume(job, data):
@@ -706,7 +707,10 @@ def _consume(job, data):
         elif tag == "COLLECTFAIL":
             job.collect_failed.add(rest)
         elif tag == "IMPORTFAIL":
-            job.import_failed.add(rest.split(" ", 1)[0])
+            name, _, detail = rest.partition(" ")
+            job.import_failed.add(name)
+            if ":" not in detail:  # (a lazy attribute failing has "Error:attr")
+                job.import_hard.add(name)
         elif tag == "CPU":
             secs, _, nodeid = rest.partition(" ")
             job.test_cpu[nodeid] = float(secs)

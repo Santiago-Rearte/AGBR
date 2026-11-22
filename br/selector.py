@@ -9,6 +9,7 @@
 import json
 import os
 import pickle
+import re
 import shutil
 import sys
 import time
@@ -54,6 +55,7 @@ PROBE_VERIFY = os.environ.get("BR_PROBE_VERIFY", "1") == "1"
 PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU seconds (calibrated)
 LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
+IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
 RT_DROP_RUN = os.environ.get("BR_RT_DROP_RUN", "0") == "1"
@@ -917,8 +919,11 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             # file importing it (even transitively, at collection) fails.  (Everything
             # is selected, so there is nothing to narrow: re-running the analysis on
             # the released caches would only burn CPU.)
-            log(f"{p.commit}: import failures {sorted(job.import_failed)[:3]}, selecting everything")
-            p.extra |= set(id2num.values())
+            everything = set(id2num.values())
+            spared = core_only_heavy(an, job.import_failed, job.import_hard, idx2num, sec) if IMPORT_NARROW else set()
+            log(f"{p.commit}: import failures {sorted(job.import_failed)[:3]}, selecting everything"
+                + (f" but {len(spared)} core-only heavy tests" if spared else ""))
+            p.extra |= everything - spared
         for nodeid in job.collect_failed:
             f = nodeid.split("::", 1)[0]
             p.extra |= {n for i, n in id2num.items() if i.split("::", 1)[0] == f}
@@ -932,6 +937,55 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
     gc.collect()
     gc.freeze()
     runner.run_jobs(jobs, parallel=PARALLEL, setup=setup, cleanup=cleanup)
+
+
+_CORE_ONLY = {}
+
+
+def core_only_heavy(an, failed, hard, idx2num, sec):
+    """Heavy tests (numbers) that cannot depend on the modules that failed to import:
+    the patched sqlglot itself still imports (none of them is imported by `import
+    sqlglot`), the test never ran a line of any dialect, parser, generator, tokenizer
+    or typing module except the base Dialect, and its test module does not import
+    any of them.  (E.g. a parser scale test when one lazily loaded dialect breaks.)"""
+    import analysis
+
+    failed = set(failed)
+    # (an eagerly imported module may only have a lazy attribute failing: it still
+    # imports, so it does not break `import sqlglot`)
+    if not failed or any(m == "sqlglot" or not m.startswith("sqlglot.") for m in failed):
+        return set()
+    if any(m in an.eager for m in hard):
+        return set()
+    if "bits" not in _CORE_ONLY:
+        fam = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/tokenizers/", "sqlglot/typing/")
+        dialect_users = 0
+        for rel, lines in an.lines.items():
+            if rel.startswith(fam) and rel != "sqlglot/dialects/dialect.py":
+                for sid in set(lines.values()):
+                    dialect_users |= an.sets[sid]
+        _CORE_ONLY["bits"] = dialect_users
+    dialect_users = _CORE_ONLY["bits"]
+    tests = an.m["tests"]
+    lasts = {m.rsplit(".", 1)[-1] for m in failed}
+    out = set()
+    for i, nid in enumerate(tests):
+        n = idx2num[i]
+        if n < 0 or sec.get(n, 0.0) < HEAVY_SEC or dialect_users >> i & 1:
+            continue
+        f = nid.split("::", 1)[0]
+        try:
+            with open(os.path.join(REPO, f), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        imports = [ln for ln in text.split("\n") if ln.lstrip().startswith(("import ", "from "))]
+        if any(m in ln for m in failed for ln in imports) or any(
+            re.search(r"\b" + re.escape(x) + r"\b", ln) for x in lasts for ln in imports
+        ):
+            continue
+        out.add(n)
+    return out
 
 
 def third_party_imports(an, test_files, plans):
