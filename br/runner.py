@@ -256,6 +256,27 @@ def _slice_lists(cls, ckey, attrs, out):
         out.write(f"SLICE {ckey} {name} {len(changed)}/{len(base)}\n")
 
 
+def limit_duckdb_threads(n):
+    """DuckDB connections opened by tests use n threads: with 2 cores, extra worker
+    threads only add synchronisation CPU (CPU time is summed over threads)."""
+    try:
+        import duckdb
+    except Exception:
+        return
+    orig = getattr(duckdb, "_br_connect", None) or duckdb.connect
+
+    def connect(*args, **kwargs):
+        config = dict(kwargs.pop("config", None) or {})
+        config.setdefault("threads", n)
+        try:
+            return orig(*args, config=config, **kwargs)
+        except Exception:
+            return orig(*args, **kwargs)
+
+    duckdb._br_connect = orig
+    duckdb.connect = connect
+
+
 def run_unittest(nodeids, out, timeouts, default_timeout, stop_on_fail=False, keep=(), slices=None,
                  record_lists=False, cont=(), phase2=()):
     """Runs unittest-style tests (all of sqlglot's) without pytest's start-up and
@@ -460,6 +481,7 @@ def check_lazy_attributes(out, base_all, only):
 
 LAZY_POOLS = os.environ.get("BR_LAZY_POOLS", "1") == "1"
 GC_THRESHOLD = int(os.environ.get("BR_GC_THRESHOLD", "0"))
+DUCKDB_THREADS = int(os.environ.get("BR_DUCKDB_THREADS", "1"))
 SUBTEST_ABORT = os.environ.get("BR_SUBTEST_ABORT", "1") == "1"
 
 
@@ -594,6 +616,8 @@ def child_main(spec, wfd):
                 evict_sqlglot()
         if spec.get("inline_pools", True):
             install_inline_pools()
+        if DUCKDB_THREADS > 0:
+            limit_duckdb_threads(DUCKDB_THREADS)
         if spec.get("import_check"):
             # A patched import can also hang (an infinite loop in code run at import
             # time): bound it, and confirm completion so the parent can tell.
