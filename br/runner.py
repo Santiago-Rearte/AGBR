@@ -593,6 +593,8 @@ def child_main(spec, wfd):
                 check_lazy_attributes(out, spec.get("lazy_all", {}), set(spec["import_check"]))
                 if spec.get("import_all", True) or spec.get("state_check") is not None:
                     check_all_modules(out, spec)
+                else:
+                    out.write("ALLOK\n")  # (only the patched modules were checked)
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
             out.write("IMPORTSOK\n")

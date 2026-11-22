@@ -56,6 +56,7 @@ PROBE_VERIFY_MAX = float(os.environ.get("BR_PROBE_VERIFY_MAX", "10.0"))  # CPU s
 LIVE_REST = os.environ.get("BR_LIVE_REST", "0") == "1"
 CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder also after a failure
 IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
+IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
 RT_DROP_RUN = os.environ.get("BR_RT_DROP_RUN", "0") == "1"
@@ -871,6 +872,7 @@ def verify(plans, runner, an, idx2num, id2num, num2id, sec):
             "nodeids": nodeids + phase2,
             "timeouts": timeouts,
             "import_check": p.modules,
+            "import_all": IMPORT_ALL or bool(p.keyref),
             "lazy_all": LAZY_ALL,
             # Once a cheap test fails the dominated heavy tests are selected anyway.
             "stop_on_fail": bool(p.conditional) or p.stop_on_fail,
