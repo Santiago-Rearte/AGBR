@@ -58,6 +58,7 @@ CONT_REST = os.environ.get("BR_CONT_REST", "0") == "1"  # verified remainder als
 IMPORT_NARROW = os.environ.get("BR_IMPORT_NARROW", "1") == "1"
 WARM_STDLIB = os.environ.get("BR_WARM_STDLIB", "1") == "1"
 WARM_SQLGLOT = os.environ.get("BR_WARM_SQLGLOT", "1") == "1"  # preload + patch functions in place
+LIVE_FRAC = float(os.environ.get("BR_LIVE_FRAC", "0.5"))  # share of the run tests a live change fails (cost model)
 IMPORT_ALL = os.environ.get("BR_IMPORT_ALL", "1") == "1"  # import every sqlglot module in the import check
 HEAVY_VERIFY = os.environ.get("BR_HEAVY_VERIFY", "0") == "1"
 HV_RATIO = float(os.environ.get("BR_HV_RATIO", "1.5"))  # verified when calibrated CPU < this x seconds
@@ -790,9 +791,9 @@ def decide(plan, cands, static, verifiable, num2id, sec, pool_nums, file_of):
             live_full = p_all
         elif p_rest == 0.0:
             # At least one failing test is selected: one worker plus the cheapest test.
-            live_full = max(WORKER_MS / 1000.0 + sec[runnable[0]], 0.5 * p_all)
+            live_full = max(WORKER_MS / 1000.0 + sec[runnable[0]], LIVE_FRAC * p_all)
         else:
-            live_full = p_rest + 0.5 * (p_all - p_rest)
+            live_full = p_rest + LIVE_FRAC * (p_all - p_rest)
         full = run_sum + (1.0 - q) * p_rest + q * live_full
         # Stop at the first failure: a live change costs little CPU, but everything
         # run is selected (assume half the run happened before the failure).
